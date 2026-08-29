@@ -262,17 +262,19 @@ describe('WorkspaceBrowser', () => {
     expect(screen.queryByText('session-6')).toBeNull()
     expect(screen.queryByText('session-7')).toBeNull()
 
-    fireEvent.click(screen.getByRole('treeitem', { name: '展开其余 2 个会话' }))
+    const overflow = screen.getByRole('treeitem', { name: '展开其余 2 个会话' })
+    expect(overflow.querySelector('button')).toBe(screen.getByRole('button', { name: '展开其余 2 个会话' }))
+    fireEvent.click(screen.getByRole('button', { name: '展开其余 2 个会话' }))
     expect(screen.getByText('session-6')).toBeTruthy()
     expect(screen.getByText('session-7')).toBeTruthy()
-    expect(screen.getByRole('treeitem', { name: '收起' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '收起' })).toBeTruthy()
 
     fireEvent.click(screen.getByText('alpha'))
     expect(b.store.getSnapshot().groupExpansion).toEqual({ alpha: false })
     fireEvent.click(screen.getByText('alpha'))
     expect(b.store.getSnapshot().groupExpansion).toEqual({ alpha: true })
     expect(screen.queryByText('session-6')).toBeNull()
-    expect(screen.getByRole('treeitem', { name: '展开其余 2 个会话' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '展开其余 2 个会话' })).toBeTruthy()
   })
 
   it('keeps the blank New Session outside the five-row folding quota', () => {
@@ -285,11 +287,11 @@ describe('WorkspaceBrowser', () => {
     expect(screen.getByText('新会话')).toBeTruthy()
     for (const item of ordinary.slice(0, 5)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
     expect(screen.queryByText('session-6')).toBeNull()
-    expect(screen.getByRole('treeitem', { name: '展开其余 1 个会话' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '展开其余 1 个会话' })).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('treeitem', { name: '展开其余 1 个会话' }))
+    fireEvent.click(screen.getByRole('button', { name: '展开其余 1 个会话' }))
     expect(screen.getByText('session-6')).toBeTruthy()
-    fireEvent.click(screen.getByRole('treeitem', { name: '收起' }))
+    fireEvent.click(screen.getByRole('button', { name: '收起' }))
     expect(screen.queryByText('session-6')).toBeNull()
 
     rerender(b, {
@@ -297,7 +299,7 @@ describe('WorkspaceBrowser', () => {
     })
     expect(screen.getByText('blank')).toBeTruthy()
     expect(screen.queryByText('session-5')).toBeNull()
-    expect(screen.getByRole('treeitem', { name: '展开其余 2 个会话' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '展开其余 2 个会话' })).toBeTruthy()
   })
 
   it('anchors collapsed drags before hidden rows so the source stays visible', async () => {
@@ -314,7 +316,7 @@ describe('WorkspaceBrowser', () => {
         .toEqual(['blank', 'session-1', 'session-2', 'session-3', 'session-4', 'session-5', 'session-6'])
     })
 
-    fireEvent.click(screen.getByRole('treeitem', { name: '展开其余 1 个会话' }))
+    fireEvent.click(screen.getByRole('button', { name: '展开其余 1 个会话' }))
     const blankRow = screen.getByText('新会话').closest('[role="treeitem"]') as HTMLElement
     const session6 = screen.getByText('session-6').closest('[role="treeitem"]') as HTMLElement
     session6.getBoundingClientRect = () => ({
@@ -327,7 +329,7 @@ describe('WorkspaceBrowser', () => {
       .toEqual(['session-1', 'session-2', 'session-3', 'session-4', 'session-5', 'session-6', 'blank'])
 
     insertSessionBefore.mockClear()
-    fireEvent.click(screen.getByRole('treeitem', { name: '收起' }))
+    fireEvent.click(screen.getByRole('button', { name: '收起' }))
     const collapsedBlank = screen.getByText('新会话').closest('[role="treeitem"]') as HTMLElement
     collapsedBlank.getBoundingClientRect = () => ({
       top: 200, bottom: 234, left: 0, right: 200, width: 200, height: 34,

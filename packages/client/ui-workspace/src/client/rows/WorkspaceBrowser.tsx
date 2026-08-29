@@ -571,17 +571,21 @@ function SessionTree({
                 )
               })}
               {collapsed.hiddenCount > 0 && (
-                <button
-                  type="button"
+                <div
                   role="treeitem"
-                  className={css.sessionOverflowButton}
-                  aria-expanded={sessionsExpanded}
-                  onClick={() => { setExpandedSessionGroups(keys => toggled(keys, group.key)) }}
+                  className={css.sessionOverflowItem}
                 >
-                  {sessionsExpanded
-                    ? t('sessions.collapse')
-                    : t('sessions.expand', { n: collapsed.hiddenCount })}
-                </button>
+                  <button
+                    type="button"
+                    className={css.sessionOverflowButton}
+                    aria-expanded={sessionsExpanded}
+                    onClick={() => { setExpandedSessionGroups(keys => toggled(keys, group.key)) }}
+                  >
+                    {sessionsExpanded
+                      ? t('sessions.collapse')
+                      : t('sessions.expand', { n: collapsed.hiddenCount })}
+                  </button>
+                </div>
               )}
             </div>
           )

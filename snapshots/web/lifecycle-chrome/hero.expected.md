@@ -13,10 +13,11 @@
 - button "Add workspace":
   - img
 - tree "Sessions":
-  - treeitem "workspace" [expanded]:
-    - img
-    - text: workspace
-  - treeitem "New Session" [selected]
+  - group:
+    - treeitem "workspace" [expanded]:
+      - img
+      - text: workspace
+    - treeitem "New Session" [selected]
 - button "Settings":
   - img
   - text: Settings

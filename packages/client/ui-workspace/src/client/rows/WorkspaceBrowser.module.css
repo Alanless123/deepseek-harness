@@ -434,7 +434,7 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-.groupSection > .sessionOverflowButton {
+.groupSection > .sessionOverflowItem {
   margin-top: 0;
 }
 
