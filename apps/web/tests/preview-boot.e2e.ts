@@ -288,7 +288,7 @@ async function bootPreview(origin: string, browser: Browser): Promise<void> {
     expect(await page.getByText('Empty environment', { exact: true }).count()).toBe(1)
     expect(await page.getByText('WebFS directory', { exact: true }).count()).toBe(1)
     expect(await page.locator('input[name="preview-source"][value="webfs"]').isDisabled()).toBe(true)
-    expect(await page.getByRole('textbox', { name: 'Choose workspace' }).count()).toBe(0)
+    expect(await page.locator('[data-composer-input][role="button"][aria-label="Choose workspace"]').count()).toBe(0)
     await compareOrRefreshGolden(
       SOURCE_CHOOSER_EXPECTED,
       await captureStableAria(page, '[data-preview-source-card]', '/__preview_no_workspace__'),
@@ -447,7 +447,8 @@ async function bootEmptyPreview(origin: string, browser: Browser): Promise<void>
     )
     expect(bootLine).toContain(`image lowering=${WRAPPER_CONTRACT}`)
     expect(bootLine).toContain('data overlays=0')
-    await page.getByRole('textbox', { name: 'Choose workspace' }).waitFor({ timeout: HERO_TIMEOUT_MS })
+    await page.locator('[data-composer-input][role="button"][aria-label="Choose workspace"]')
+      .waitFor({ timeout: HERO_TIMEOUT_MS })
     const sessionCount = await page.evaluate(async () => {
       const transport = (globalThis as typeof globalThis & {
         __DSH_TRANSPORT__?: { fetch(input: string, init: RequestInit): Promise<Response> }

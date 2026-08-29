@@ -98,10 +98,12 @@ describe('resident composer', () => {
     fireEvent.click(textarea!)
     expect(view.getByTestId('workspace-probe').textContent).toBe('true:0')
     expect(textarea!.getAttribute('aria-expanded')).toBe('true')
-    fireEvent.click(view.getByRole('button', { name: '选择工作区' }))
+    const workspaceChip = view.container.querySelector<HTMLButtonElement>('button[aria-label="选择工作区"]')
+    expect(workspaceChip).not.toBeNull()
+    fireEvent.click(workspaceChip!)
     fireEvent.keyDown(textarea!, { key: 'Enter' })
     expect(view.getByTestId('workspace-probe').textContent).toBe('true:0')
-    expect(view.getByRole('button', { name: '选择工作区' })).toBeTruthy()
+    expect(workspaceChip).toBeTruthy()
     await runtime.dispose()
   })
 
@@ -124,7 +126,7 @@ describe('resident composer', () => {
     const scrollBody = view.container.querySelector('[data-conversation-scroll]')!
     const composerSeat = view.container.querySelector('[data-composer-seat]')!
     const textarea = view.container.querySelector<HTMLDivElement>('[data-composer-input]')!
-    const workspaceChip = view.getByRole('button', { name: '选择工作区' })
+    const workspaceChip = view.container.querySelector<HTMLButtonElement>('button[aria-label="选择工作区"]')!
     const workspaceProbe = view.getByTestId('workspace-probe')
     expect(textarea.getAttribute('aria-disabled')).not.toBe('true')
     expect(textarea.getAttribute('contenteditable')).not.toBe('true')

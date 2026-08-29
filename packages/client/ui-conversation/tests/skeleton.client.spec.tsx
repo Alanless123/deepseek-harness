@@ -353,10 +353,16 @@ describe('ConversationRoot resident composer', () => {
       summaryBlank: true,
       composerBlock: { reason: 'select a model first' },
     })
-    const box = b.view.getByRole('textbox')
+    const box = b.view.container.querySelector<HTMLElement>('[data-composer-input]')
+    expect(box).not.toBeNull()
+    if (box === null) throw new Error('resident composer input must exist')
+    expect(box.getAttribute('role')).toBe('button')
+    expect(box.getAttribute('aria-label')).toBe('选择工作区')
     expect(box.getAttribute('aria-disabled')).not.toBe('true')
     expect(box.getAttribute('contenteditable')).not.toBe('true')
     expect(box.getAttribute('aria-haspopup')).toBe('menu')
+    expect(box.getAttribute('aria-expanded')).toBe('false')
+    expect(box.hasAttribute('aria-multiline')).toBe(false)
     expect(box.getAttribute('data-placeholder')).not.toBe('select a model first')
     const modelSeat = b.seatOwners.filter(call => call.key === 'conversation.input.model').at(-1)?.owner
     expect(modelSeat).toEqual({ locked: true })

@@ -977,6 +977,8 @@ describe('running and lock semantics', () => {
     })
     expect(textarea.getAttribute('aria-disabled')).not.toBe('true')
     expect(editableOf(textarea)).toBe(false)
+    expect(textarea.getAttribute('role')).toBe('button')
+    expect(textarea.hasAttribute('aria-multiline')).toBe(false)
     expect(textarea.getAttribute('aria-haspopup')).toBe('menu')
     expect(textarea.getAttribute('aria-expanded')).toBe('false')
     expect((view.getByLabelText('指令') as HTMLButtonElement).disabled).toBe(true)

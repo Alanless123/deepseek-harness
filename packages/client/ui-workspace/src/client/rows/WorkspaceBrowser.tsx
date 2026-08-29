@@ -430,8 +430,8 @@ function SessionTree({
       {workspaceDropAtListStart && <span className={css.listTopDropIndicator} aria-hidden="true" />}
       <div
         className={clsx(css.list, workspaceDropAtListStart && css.listTopDropActive)}
-        role="tree"
-        aria-label={t('section.sessions')}
+        role={groups.length === 0 ? undefined : 'tree'}
+        aria-label={groups.length === 0 ? undefined : t('section.sessions')}
       >
         {groups.length === 0 && (
           <div className={css.empty}>{t('empty.none')}</div>
@@ -476,6 +476,7 @@ function SessionTree({
           // (WorkspaceBrowser.module.css).
             <div
               key={group.key}
+              role="group"
               className={clsx(
                 css.groupSection,
                 workspaceMarker === 'before' && css.workspaceDropBefore,
@@ -572,6 +573,7 @@ function SessionTree({
               {collapsed.hiddenCount > 0 && (
                 <button
                   type="button"
+                  role="treeitem"
                   className={css.sessionOverflowButton}
                   aria-expanded={sessionsExpanded}
                   onClick={() => { setExpandedSessionGroups(keys => toggled(keys, group.key)) }}
@@ -667,7 +669,11 @@ function FlatList({
   const now = Date.now()
   return (
     <div className={clsx(css.treeBody, css.wide)}>
-      <div className={clsx(css.list, css.flatList)} role="tree" aria-label={t('section.sessions')}>
+      <div
+        className={clsx(css.list, css.flatList)}
+        role={rows.length === 0 ? undefined : 'tree'}
+        aria-label={rows.length === 0 ? undefined : t('section.sessions')}
+      >
         {rows.length === 0 && (
           <div className={css.empty}>{t('empty.none')}</div>
         )}
@@ -761,7 +767,11 @@ function SearchResults({
   return (
     <div className={clsx(css.treeBody, css.wide)}>
       <div className={css.list}>
-        <div className={css.searchTree} role="tree" aria-label={t('search.results.aria')}>
+        <div
+          className={css.searchTree}
+          role={results.items.length === 0 ? undefined : 'tree'}
+          aria-label={results.items.length === 0 ? undefined : t('search.results.aria')}
+        >
           {results.items.map(result => (
             <SearchResultItem
               key={result.id}

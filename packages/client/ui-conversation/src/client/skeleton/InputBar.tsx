@@ -418,6 +418,8 @@ export function InputBar({
               // The placeholder was the textarea's accessible name; a div's
               // data attribute is not, so the label restores it.
               aria-label={workspaceTrigger ? t('hero.chooseWorkspace') : placeholderText}
+              role={workspaceTrigger ? 'button' : 'textbox'}
+              aria-multiline={workspaceTrigger ? undefined : 'true'}
               aria-haspopup={workspaceTrigger ? 'menu' : undefined}
               aria-expanded={workspaceTrigger ? workspacePickerOpen : undefined}
               tabIndex={workspaceTrigger ? 0 : undefined}

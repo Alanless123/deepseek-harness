@@ -191,7 +191,7 @@ describe('web e2e: navigation & panes over a rich seeded session', () => {
     await search.fill('zzzqx-no-such-session')
     await page.getByText('No matching sessions').waitFor({ timeout: 30_000 })
     await expect.poll(
-      () => page.getByRole('tree', { name: 'Search results' }).getByRole('treeitem').count(),
+      () => page.getByRole('tree', { name: 'Search results' }).count(),
       { timeout: 10_000 },
     ).toBe(0)
 
