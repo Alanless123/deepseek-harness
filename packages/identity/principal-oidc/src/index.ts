@@ -142,11 +142,12 @@ interface LoginTransaction {
 }
 
 interface SessionRecord {
-  readonly context: AuthenticatedPrincipalContext
-  readonly controller: AbortController
+  context: AuthenticatedPrincipalContext
+  controller: AbortController
   readonly accessToken: string
   readonly subject: string
   readonly sid?: string
+  availability: 'available' | 'unavailable'
   lastValidatedAt: number
   revalidating?: Promise<void>
 }
@@ -243,13 +244,19 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     if (sessionId === undefined || !isOpaqueId(sessionId)) throw unauthenticated()
     const session = this.sessions.get(sessionId)
     if (session === undefined) throw unauthenticated()
-    try {
-      assertPrincipalContextActive(session.context)
-    } catch (error) {
-      this.revokeSession(sessionId, 'OIDC session expired')
-      throw error
+    this.assertSessionLifetime(sessionId, session)
+    if (session.availability === 'available') {
+      try {
+        assertPrincipalContextActive(session.context)
+      } catch (error) {
+        this.revokeSession(sessionId, 'OIDC session expired')
+        throw error
+      }
     }
     await this.revalidateSession(sessionId, session, false)
+    this.assertSessionCurrent(sessionId, session)
+    if (session.availability === 'unavailable') throw providerUnavailable()
+    assertPrincipalContextActive(session.context)
     return session.context
   }
 
@@ -318,11 +325,14 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     if (sessionId === undefined || !isOpaqueId(sessionId)) throw unauthenticated()
     const session = this.sessions.get(sessionId)
     if (session === undefined || session.context !== context) throw unauthenticated()
-    try {
-      assertPrincipalContextActive(context)
-    } catch (error) {
-      this.revokeSession(sessionId, 'OIDC session expired')
-      throw error
+    this.assertSessionLifetime(sessionId, session)
+    if (session.availability === 'available') {
+      try {
+        assertPrincipalContextActive(context)
+      } catch (error) {
+        this.revokeSession(sessionId, 'OIDC session expired')
+        throw error
+      }
     }
     await this.revalidateSession(sessionId, session, true)
   }
@@ -386,6 +396,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
         accessToken,
         subject: claims.sub,
         ...(sid === undefined ? {} : { sid }),
+        availability: 'available',
         lastValidatedAt: now,
       })
       establishedSessionId = sessionId
@@ -539,8 +550,11 @@ export class OidcPrincipalProvider extends PrincipalProvider {
   }
 
   private async revalidateSession(sessionId: string, session: SessionRecord, force: boolean): Promise<void> {
-    assertPrincipalContextActive(session.context)
-    if (!force && Date.now() - session.lastValidatedAt < this.options.revalidateIntervalMs) return
+    this.assertSessionLifetime(sessionId, session)
+    if (session.availability === 'available') assertPrincipalContextActive(session.context)
+    if (!force
+      && session.availability === 'available'
+      && Date.now() - session.lastValidatedAt < this.options.revalidateIntervalMs) return
     if (session.revalidating !== undefined) return session.revalidating
     const pending = this.performRevalidation(sessionId, session).finally(() => {
       if (session.revalidating === pending) delete session.revalidating
@@ -554,14 +568,11 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     try {
       introspection = await this.introspect(session.accessToken)
     } catch (cause) {
-      this.revokeSession(sessionId, 'OIDC introspection unavailable')
-      throw new PrincipalAuthenticationError(
-        'principal-unavailable',
-        503,
-        'identity provider unavailable',
-        { cause },
-      )
+      this.assertSessionLifetime(sessionId, session)
+      this.markSessionUnavailable(session, 'OIDC introspection unavailable')
+      throw providerUnavailable(cause)
     }
+    this.assertSessionCurrent(sessionId, session)
     try {
       validateIntrospection(introspection, session.subject, this.options)
     } catch (cause) {
@@ -573,11 +584,46 @@ export class OidcPrincipalProvider extends PrincipalProvider {
         { cause },
       )
     }
+    this.assertSessionLifetime(sessionId, session)
+    if (session.availability === 'unavailable') this.restoreSessionContext(sessionId, session)
     session.lastValidatedAt = Date.now()
   }
 
   private introspect(accessToken: string): Promise<IntrospectionResponse> {
     return tokenIntrospection(this.oidc, accessToken, { token_type_hint: 'access_token' })
+  }
+
+  private assertSessionCurrent(sessionId: string, session: SessionRecord): void {
+    if (this.sessions.get(sessionId) !== session) throw unauthenticated()
+  }
+
+  private assertSessionLifetime(sessionId: string, session: SessionRecord): void {
+    this.assertSessionCurrent(sessionId, session)
+    if (session.context.expiresAt > Date.now()) return
+    this.revokeSession(sessionId, 'OIDC session expired')
+    throw new PrincipalAuthenticationError(
+      'principal-unauthenticated',
+      401,
+      'authenticated Principal is no longer active',
+    )
+  }
+
+  private markSessionUnavailable(session: SessionRecord, reason: string): void {
+    session.availability = 'unavailable'
+    if (!session.controller.signal.aborted) session.controller.abort(new Error(reason))
+  }
+
+  private restoreSessionContext(sessionId: string, session: SessionRecord): void {
+    const controller = new AbortController()
+    session.controller = controller
+    session.context = Object.freeze({
+      principal: session.context.principal,
+      expiresAt: session.context.expiresAt,
+      invalidated: controller.signal,
+      revalidateIntervalMs: session.context.revalidateIntervalMs,
+      sessionId,
+    })
+    session.availability = 'available'
   }
 
   private revokeSession(sessionId: string, reason: string): void {
@@ -991,6 +1037,15 @@ function isLoopback(hostname: string): boolean {
 
 function unauthenticated(): PrincipalAuthenticationError {
   return new PrincipalAuthenticationError('principal-unauthenticated', 401, 'authenticated Principal is required')
+}
+
+function providerUnavailable(cause?: unknown): PrincipalAuthenticationError {
+  return new PrincipalAuthenticationError(
+    'principal-unavailable',
+    503,
+    'identity provider unavailable',
+    { cause },
+  )
 }
 
 function writeUnavailable(response: PrincipalResponse): void {

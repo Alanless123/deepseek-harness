@@ -467,25 +467,94 @@ describe('OIDC Principal provider', () => {
       .rejects.toThrow('HTTP requires explicit loopback development mode')
   })
 
-  it('aborts active contexts when introspection reports revocation or becomes unavailable', async () => {
+  it('deletes inactive sessions permanently, including after a transient outage', async () => {
     const revokedProvider = await createProvider()
     const revoked = await activeSession(revokedProvider)
     issuer.introspectionActive = false
     await expect(revokedProvider.revalidate(revoked.context)).rejects.toMatchObject({ status: 401 })
     expect(revoked.context.invalidated.aborted).toBe(true)
+    issuer.introspectionActive = true
     await expect(revokedProvider.authenticate({
       url: '/api',
       headers: { host: APP_HOST, cookie: revoked.cookie },
     })).rejects.toMatchObject({ status: 401 })
 
-    issuer.introspectionActive = true
-    issuer.introspectionOutage = false
-    const unavailableProvider = await createProvider()
-    const unavailable = await activeSession(unavailableProvider)
+    const outageProvider = await createProvider()
+    const outage = await activeSession(outageProvider)
     issuer.introspectionOutage = true
-    await expect(unavailableProvider.revalidate(unavailable.context)).rejects.toMatchObject({ status: 503 })
-    expect(unavailable.context.invalidated.aborted).toBe(true)
+    await expect(outageProvider.revalidate(outage.context)).rejects.toMatchObject({ status: 503 })
+    expect(outage.context.invalidated.aborted).toBe(true)
     issuer.introspectionOutage = false
+    issuer.introspectionActive = false
+    await expect(outageProvider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: outage.cookie },
+    })).rejects.toMatchObject({ status: 401 })
+    issuer.introspectionActive = true
+    await expect(outageProvider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: outage.cookie },
+    })).rejects.toMatchObject({ status: 401 })
+
+    const expiringProvider = await createProvider()
+    const expiring = await activeSession(expiringProvider)
+    issuer.introspectionOutage = true
+    await expect(expiringProvider.revalidate(expiring.context)).rejects.toMatchObject({ status: 503 })
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(expiring.context.expiresAt)
+      await expect(expiringProvider.authenticate({
+        url: '/api',
+        headers: { host: APP_HOST, cookie: expiring.cookie },
+      })).rejects.toMatchObject({ status: 401 })
+    } finally {
+      vi.useRealTimers()
+    }
+    issuer.introspectionOutage = false
+    await expect(expiringProvider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: expiring.cookie },
+    })).rejects.toMatchObject({ status: 401 })
+  })
+
+  it('retains an unavailable opaque session and restores it with a fresh context', async () => {
+    const provider = await createProvider()
+    const session = await activeSession(provider)
+    issuer.introspectionOutage = true
+
+    await expect(provider.revalidate(session.context)).rejects.toMatchObject({
+      code: 'principal-unavailable',
+      status: 503,
+    })
+    expect(session.context.invalidated.aborted).toBe(true)
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: session.cookie },
+    })).rejects.toMatchObject({ code: 'principal-unavailable', status: 503 })
+
+    const index = new TestResponse()
+    await expect(provider.authorizeIndex({
+      method: 'GET',
+      url: '/quotes/current',
+      headers: { host: APP_HOST, cookie: session.cookie },
+    }, index)).resolves.toBe(false)
+    expect(index.status).toBe(503)
+    expect(index.body).toBe('identity provider unavailable')
+    expect(index.header('location')).toBeUndefined()
+
+    issuer.introspectionOutage = false
+    await expect(provider.revalidate(session.context)).resolves.toBeUndefined()
+    const recovered = await provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: session.cookie },
+    })
+    expect(recovered).not.toBe(session.context)
+    expect(recovered.principal).toBe(session.context.principal)
+    expect(recovered.sessionId).toBe(session.context.sessionId)
+    expect(recovered.invalidated.aborted).toBe(false)
+    expect(session.context.invalidated.aborted).toBe(true)
+    await expect(provider.revalidate(session.context)).rejects.toMatchObject({ status: 401 })
+    await expect(provider.revalidate(recovered)).resolves.toBeUndefined()
   })
 
   it.each([
@@ -524,6 +593,29 @@ describe('OIDC Principal provider', () => {
     expect(callback.status).toBe(401)
     expect(callback.body).toBe('unauthorized')
     expect(() => responseCookie(callback, 'dsh_oidc_session')).toThrow()
+  })
+
+  it('does not restore a session when back-channel logout wins a revalidation race', async () => {
+    const provider = await createProvider()
+    const session = await activeSession(provider)
+    const pause = issuer.pauseNextIntrospection()
+    const revalidating = provider.revalidate(session.context)
+    try {
+      await pause.entered
+      await provider.processBackchannelLogout(await issuer.logoutToken({
+        sid: 'sid-1',
+        jti: 'logout-during-revalidation',
+      }))
+    } finally {
+      pause.release()
+    }
+
+    await expect(revalidating).rejects.toMatchObject({ status: 401 })
+    expect(session.context.invalidated.aborted).toBe(true)
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: session.cookie },
+    })).rejects.toMatchObject({ status: 401 })
   })
 
   it('rolls back a newly established session when the callback response fails', async () => {
@@ -583,6 +675,10 @@ describe('OIDC Principal provider', () => {
     expect(logoutLocation.searchParams.get('post_logout_redirect_uri')).toBe(`${APP_ORIGIN}/signed-out`)
     expect(logoutLocation.searchParams.has('id_token_hint')).toBe(false)
     expect(front.context.invalidated.aborted).toBe(true)
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: front.cookie },
+    })).rejects.toMatchObject({ status: 401 })
 
     const back = await activeSession(provider)
     const wrongAudience = await issuer.logoutToken({ sid: 'sid-1', audience: 'other-client', jti: 'wrong-aud' })
@@ -591,6 +687,10 @@ describe('OIDC Principal provider', () => {
     const logoutToken = await issuer.logoutToken({ sid: 'sid-1', jti: 'logout-1' })
     await provider.processBackchannelLogout(logoutToken)
     expect(back.context.invalidated.aborted).toBe(true)
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: back.cookie },
+    })).rejects.toMatchObject({ status: 401 })
     await expect(provider.processBackchannelLogout(logoutToken)).rejects.toThrow('replayed')
   })
 
