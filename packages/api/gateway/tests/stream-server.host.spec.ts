@@ -250,6 +250,45 @@ describe('Remote stream mux server carrier lifecycle', () => {
     expect(String(unavailableEvent[1])).toBe('authenticated Principal is no longer active')
     expect(revalidate).toHaveBeenCalled()
   })
+
+  it('keeps periodic Principal revalidation single-flight', async () => {
+    const context: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:single-flight' },
+      expiresAt: Date.now() + 60_000,
+      invalidated: new AbortController().signal,
+      revalidateIntervalMs: 10,
+    }
+    const release = Promise.withResolvers<undefined>()
+    let active = 0
+    let maximumActive = 0
+    const revalidate = vi.fn(async () => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      try {
+        if (revalidate.mock.calls.length === 1) await release.promise
+      } finally {
+        active -= 1
+      }
+    })
+    const entry = await startMux(
+      async (_endpoint, _payload, signal) => waitForAbort(signal),
+      30_000,
+      context,
+      revalidate,
+    )
+    const client = await connect(entry.url)
+    await vi.waitFor(() => { expect(revalidate).toHaveBeenCalledOnce() })
+    await new Promise<void>((resolve) => { setTimeout(resolve, 35) })
+    expect(revalidate).toHaveBeenCalledOnce()
+    expect(maximumActive).toBe(1)
+
+    release.resolve(undefined)
+    await vi.waitFor(() => { expect(revalidate.mock.calls.length).toBeGreaterThan(1) })
+    expect(maximumActive).toBe(1)
+    const closed = once(client, 'close')
+    client.close()
+    await closed
+  })
 })
 
 const mapFailure: RemoteStreamFailureMapper = error => ({

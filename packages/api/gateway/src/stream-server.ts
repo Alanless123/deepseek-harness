@@ -126,10 +126,15 @@ class RemoteStreamMuxConnection {
     })
     this.context.invalidated?.addEventListener('abort', invalidate, { once: true })
     if (this.context.invalidated?.aborted === true) invalidate()
+    let revalidationInFlight: Promise<void> | undefined
     const revalidation = this.revalidate === undefined || this.context.revalidateIntervalMs === undefined
       ? undefined
       : setInterval(() => {
-        void this.revalidate?.(this.context).catch(invalidate)
+        if (revalidationInFlight !== undefined) return
+        const pending = this.revalidate?.(this.context).catch(invalidate).finally(() => {
+          if (revalidationInFlight === pending) revalidationInFlight = undefined
+        })
+        revalidationInFlight = pending
       }, this.context.revalidateIntervalMs)
     revalidation?.unref()
     try {

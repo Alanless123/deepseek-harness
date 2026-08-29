@@ -56,12 +56,31 @@ class TestResponse {
   }
 }
 
+class FailFirstEndResponse extends TestResponse {
+  readonly setCookieHistory: (string | readonly string[])[] = []
+  private fail = true
+
+  override setHeader(name: string, value: string | readonly string[]): this {
+    if (name.toLowerCase() === 'set-cookie') this.setCookieHistory.push(value)
+    return super.setHeader(name, value)
+  }
+
+  override end(body = ''): this {
+    if (this.fail) {
+      this.fail = false
+      throw new Error('fixture callback response failure')
+    }
+    return super.end(body)
+  }
+}
+
 class MockIssuer {
   readonly server: Server
   issuer = ''
   mode: TokenMode = 'valid'
   introspectionActive = true
   introspectionOutage = false
+  jwksOutage = false
   discoveryIssuerOverride: string | undefined
   expectedChallenge = ''
   expectedNonce = ''
@@ -161,6 +180,10 @@ class MockIssuer {
       return
     }
     if (url.pathname === '/realms/test/jwks') {
+      if (this.jwksOutage) {
+        json(response, 503, { error: 'temporarily_unavailable' })
+        return
+      }
       json(response, 200, { keys: [this.jwk] })
       return
     }
@@ -474,14 +497,56 @@ describe('OIDC Principal provider', () => {
     expect(() => responseCookie(callback, 'dsh_oidc_session')).toThrow()
   })
 
+  it('rolls back a newly established session when the callback response fails', async () => {
+    issuer.mode = 'valid'
+    issuer.introspectionActive = true
+    issuer.introspectionOutage = false
+    const provider = await createProvider()
+    const login = await beginLogin(provider)
+    const response = new FailFirstEndResponse()
+    await provider.handleCallback({
+      method: 'GET',
+      url: `${CALLBACK_PATH}?code=authorization-code&state=${encodeURIComponent(login.location.searchParams.get('state') ?? '')}`,
+      headers: { host: APP_HOST, cookie: login.transactionCookie },
+    }, response)
+
+    expect(response.status).toBe(401)
+    const issued = response.setCookieHistory.flatMap(value => typeof value === 'string' ? [value] : value)
+      .find(value => value.startsWith('dsh_oidc_session=') && !value.startsWith('dsh_oidc_session=;'))
+    expect(issued).toBeDefined()
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: issued?.split(';', 1)[0] ?? '' },
+    })).rejects.toMatchObject({ status: 401 })
+  })
+
   it('supports local/RP logout and signed replay-safe back-channel logout', async () => {
     const provider = await createProvider()
     const front = await activeSession(provider)
+    const get = new TestResponse()
+    provider.handleLogout({
+      method: 'GET',
+      url: '/.dsh/oidc/logout',
+      headers: { host: APP_HOST, cookie: front.cookie, origin: APP_ORIGIN },
+    }, get)
+    expect(get.status).toBe(405)
+    expect(get.header('allow')).toBe('POST')
+    expect(front.context.invalidated.aborted).toBe(false)
+
+    const crossSite = new TestResponse()
+    provider.handleLogout({
+      method: 'POST',
+      url: '/.dsh/oidc/logout',
+      headers: { host: APP_HOST, cookie: front.cookie, origin: 'https://attacker.example' },
+    }, crossSite)
+    expect(crossSite.status).toBe(403)
+    expect(front.context.invalidated.aborted).toBe(false)
+
     const logout = new TestResponse()
     provider.handleLogout({
       method: 'POST',
       url: '/.dsh/oidc/logout',
-      headers: { host: APP_HOST, cookie: front.cookie },
+      headers: { host: APP_HOST, cookie: front.cookie, origin: APP_ORIGIN },
     }, logout)
     expect(logout.status).toBe(303)
     const logoutLocation = new URL(stringHeader(logout, 'location'))
@@ -498,6 +563,33 @@ describe('OIDC Principal provider', () => {
     await provider.processBackchannelLogout(logoutToken)
     expect(back.context.invalidated.aborted).toBe(true)
     await expect(provider.processBackchannelLogout(logoutToken)).rejects.toThrow('replayed')
+  })
+
+  it('stores a bounded hash of back-channel logout token ids', async () => {
+    const provider = await createProvider({ maxSessions: 1 })
+    for (const jti of ['raw-jti-1', 'raw-jti-2', 'raw-jti-3']) {
+      await provider.processBackchannelLogout(await issuer.logoutToken({ sid: 'sid-1', jti }))
+    }
+    const ids = Reflect.get(provider, 'logoutTokenIds') as Map<string, number>
+    expect(ids.size).toBe(2)
+    expect([...ids.keys()]).toEqual(expect.not.arrayContaining(['raw-jti-1', 'raw-jti-2', 'raw-jti-3']))
+    expect([...ids.keys()]).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/u),
+    ]))
+  })
+
+  it('maps an unavailable remote JWKS to Principal provider unavailability', async () => {
+    const provider = await createProvider()
+    const token = await issuer.logoutToken({ sid: 'sid-1', jti: 'jwks-outage' })
+    issuer.jwksOutage = true
+    try {
+      await expect(provider.processBackchannelLogout(token)).rejects.toMatchObject({
+        code: 'principal-unavailable',
+        status: 503,
+      })
+    } finally {
+      issuer.jwksOutage = false
+    }
   })
 })
 

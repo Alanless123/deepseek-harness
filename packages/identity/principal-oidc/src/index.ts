@@ -1,6 +1,6 @@
 /** Host-only OpenID Connect implementation of the authenticated Principal seam. */
 
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -52,6 +52,7 @@ const CLOCK_TOLERANCE_SECONDS = 30
 const BACKCHANNEL_MAX_AGE_SECONDS = 5 * 60
 const MAX_REVALIDATE_INTERVAL_SECONDS = 60
 const MIN_STREAM_REVALIDATE_INTERVAL_MS = 1_000
+const MAX_LOGOUT_TOKEN_IDS = 20_000
 const MAX_LOGOUT_TARGET_TOMBSTONES = 20_000
 
 /** OIDC client and in-memory Host session configuration. */
@@ -337,6 +338,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
       this.options.secureCookies,
     )
     let transaction: LoginTransaction | undefined
+    let establishedSessionId: string | undefined
     try {
       const callbackUrl = this.exactCallbackUrl(request)
       if (request.method !== undefined && request.method !== 'GET') throw new Error('callback method rejected')
@@ -385,6 +387,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
         ...(sid === undefined ? {} : { sid }),
         lastValidatedAt: now,
       })
+      establishedSessionId = sessionId
       response.setHeader?.('set-cookie', [
         clearTransaction,
         serializeCookie(
@@ -401,7 +404,13 @@ export class OidcPrincipalProvider extends PrincipalProvider {
       })
       response.end()
     } catch (error) {
-      response.setHeader?.('set-cookie', clearTransaction)
+      if (establishedSessionId !== undefined) {
+        this.revokeSession(establishedSessionId, 'OIDC callback response failed')
+      }
+      response.setHeader?.('set-cookie', [
+        clearTransaction,
+        clearCookie(SESSION_COOKIE, '/', this.options.secureCookies),
+      ])
       const status = isProviderFailure(error) ? 503 : 401
       response.writeHead(status, {
         'cache-control': 'no-store',
@@ -417,13 +426,18 @@ export class OidcPrincipalProvider extends PrincipalProvider {
    * @param response - response that clears the session cookie and redirects.
    */
   handleLogout(request: PrincipalRequest, response: OidcResponse): void {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
+      response.end()
+      return
+    }
+    if (headerValue(request.headers, 'origin') !== this.options.redirectUri.origin) {
+      response.writeHead(403, { 'cache-control': 'no-store' })
+      response.end()
+      return
+    }
     try {
       this.assertApplicationAuthority(request)
-      if (request.method !== undefined && request.method !== 'GET' && request.method !== 'POST') {
-        response.writeHead(405, { allow: 'GET, POST', 'cache-control': 'no-store' })
-        response.end()
-        return
-      }
       const sessionId = cookieValue(request.headers, SESSION_COOKIE)
       if (sessionId !== undefined && isOpaqueId(sessionId)) this.revokeSession(sessionId, 'OIDC front-channel logout')
       response.setHeader?.('set-cookie', clearCookie(SESSION_COOKIE, '/', this.options.secureCookies))
@@ -448,13 +462,25 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     if (typeof logoutToken !== 'string' || logoutToken.length === 0 || logoutToken.length > MAX_BACKCHANNEL_BODY_BYTES) {
       throw new Error('invalid logout token')
     }
-    const { payload, protectedHeader } = await jwtVerify<BackchannelLogoutClaims>(logoutToken, this.logoutKeys, {
-      issuer: this.options.issuer,
-      audience: this.options.clientId,
-      algorithms: [this.options.signingAlgorithm],
-      clockTolerance: CLOCK_TOLERANCE_SECONDS,
-      maxTokenAge: BACKCHANNEL_MAX_AGE_SECONDS,
-    })
+    let verification: Awaited<ReturnType<typeof jwtVerify<BackchannelLogoutClaims>>>
+    try {
+      verification = await jwtVerify<BackchannelLogoutClaims>(logoutToken, this.logoutKeys, {
+        issuer: this.options.issuer,
+        audience: this.options.clientId,
+        algorithms: [this.options.signingAlgorithm],
+        clockTolerance: CLOCK_TOLERANCE_SECONDS,
+        maxTokenAge: BACKCHANNEL_MAX_AGE_SECONDS,
+      })
+    } catch (cause) {
+      if (!isJwksProviderFailure(cause)) throw cause
+      throw new PrincipalAuthenticationError(
+        'principal-unavailable',
+        503,
+        'identity provider unavailable',
+        { cause },
+      )
+    }
+    const { payload, protectedHeader } = verification
     if (protectedHeader.alg !== this.options.signingAlgorithm) throw new Error('unexpected logout token algorithm')
     if (protectedHeader.typ !== undefined && protectedHeader.typ.toLowerCase() !== 'logout+jwt') {
       throw new Error('unexpected logout token type')
@@ -471,8 +497,11 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     else if (subject !== undefined) logoutTarget = logoutTargetKey('sub', subject)
     else throw new Error('logout token has no session target')
     this.cleanupLogoutTokenIds()
-    if (this.logoutTokenIds.has(payload.jti)) throw new Error('logout token replayed')
-    this.logoutTokenIds.set(payload.jti, Date.now() + BACKCHANNEL_MAX_AGE_SECONDS * 1_000)
+    const tokenId = logoutTokenId(payload.jti)
+    if (this.logoutTokenIds.has(tokenId)) throw new Error('logout token replayed')
+    const maximum = Math.min(MAX_LOGOUT_TOKEN_IDS, Math.max(2, this.options.maxSessions * 2))
+    this.makeRoom(this.logoutTokenIds, maximum)
+    this.logoutTokenIds.set(tokenId, Date.now() + BACKCHANNEL_MAX_AGE_SECONDS * 1_000)
     this.rememberLogoutTarget(logoutTarget, payload.iat)
 
     for (const [sessionId, session] of [...this.sessions]) {
@@ -924,6 +953,10 @@ function logoutTargetKey(kind: 'sid' | 'sub', value: string): string {
   return `${kind}\0${value}`
 }
 
+function logoutTokenId(jti: string): string {
+  return createHash('sha256').update(jti).digest('base64url')
+}
+
 function requireNonEmpty(value: string, label: string): void {
   if (typeof value !== 'string' || value.trim() === '' || value.includes('\0')) {
     throw new TypeError(`OIDC ${label} must be a non-empty string without NUL`)
@@ -960,6 +993,7 @@ function writeUnavailable(response: PrincipalResponse): void {
 }
 
 function isProviderFailure(error: unknown): boolean {
+  if (error instanceof PrincipalAuthenticationError) return error.status === 503
   if (error instanceof TypeError) {
     return error.message === 'fetch failed' || isNetworkCause(error.cause)
   }
@@ -983,6 +1017,12 @@ function isProviderFailure(error: unknown): boolean {
   }
   if (error instanceof joseErrors.JWKSTimeout || error instanceof joseErrors.JWKSInvalid) return true
   return error instanceof Error && error.cause !== undefined && isProviderFailure(error.cause)
+}
+
+function isJwksProviderFailure(error: unknown): boolean {
+  if (error instanceof joseErrors.JWKSTimeout || error instanceof joseErrors.JWKSInvalid) return true
+  if (error instanceof joseErrors.JOSEError) return error.code === 'ERR_JOSE_GENERIC'
+  return error instanceof TypeError && (error.message === 'fetch failed' || isNetworkCause(error.cause))
 }
 
 function isNetworkCause(cause: unknown): boolean {

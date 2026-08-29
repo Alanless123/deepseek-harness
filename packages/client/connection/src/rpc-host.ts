@@ -148,7 +148,16 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   /** Enter Principal ALS only for contexts created by the Host authenticator. */
   runWithRequestContext<T>(context: ConnectionRequestContext, callback: () => T): T {
-    if (context.principal === undefined) return callback()
+    if (context.principal === undefined) {
+      if (this.principalOptions.principalMode === 'required') {
+        throw new PrincipalAuthenticationError(
+          'principal-unauthenticated',
+          401,
+          'authenticated Principal is required',
+        )
+      }
+      return callback()
+    }
     const principals = this.principalOptions.principals?.()
     if (principals === undefined) throw new PrincipalAuthenticationError('principal-unavailable', 503, 'Principal context service is unavailable')
     return principals.run(context as AuthenticatedPrincipalContext, callback)
@@ -182,17 +191,17 @@ export class HostConnectionService extends Service implements HostConnectionHand
     channel: '/api',
   ): ConnectionFetchHandler {
     return {
-      fetch: (request, context = {}) => {
+      fetch: async (request, context = {}) => this.runWithRequestContext(context, async () => {
         const pathname = new URL(request.url).pathname
         const route = this.fetchRoutes.get(pathname)
         if (route?.methods.has(request.method) === true) return route.fetch(request, context)
         const endpoint = endpointFromPath(channel, pathname)
         const interceptor = this.interceptors.get(channel)
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
-          return Promise.resolve(new Response('not found', { status: 404 }))
+          return new Response('not found', { status: 404 })
         }
         return interceptor.fetchHandler.fetch(request, context)
-      },
+      }),
     }
   }
 

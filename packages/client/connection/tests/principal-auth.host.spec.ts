@@ -101,4 +101,43 @@ describe('Connection Principal authentication', () => {
     await expect(unavailable.connection.authenticateRequest(trustedRequest)).resolves.toEqual({ ok: false, rejection: 503 })
     await unavailable.dispose()
   })
+
+  it('rejects empty required contexts before direct, exact, or shared dispatch', async () => {
+    const { connection, dispose } = await mounted({} as PrincipalProvider)
+    const direct = vi.fn((): undefined => undefined)
+    expect(() => { connection.runWithRequestContext({}, direct) })
+      .toThrow(expect.objectContaining({ status: 401 }))
+    expect(direct).not.toHaveBeenCalled()
+
+    const exact = vi.fn(async () => new Response('exact'))
+    connection.fetch.register({ path: '/api/cpq-export', methods: ['GET'], fetch: exact })
+    const unary = vi.fn(async () => ({ ok: true as const, value: null }))
+    connection.rpc.intercept('/api', endpoint => endpoint === 'cpq/read', unary)
+    const shared = connection.createSharedFetchHandler('/api')
+
+    await expect(shared.fetch(new Request('http://host/api/cpq-export')))
+      .rejects.toMatchObject({ status: 401 })
+    const message: ClientRequest = {
+      type: 'client-request',
+      rpcId: RpcId('principal-empty'),
+      method: 'cpq/read',
+      payload: {},
+    }
+    await expect(shared.fetch(new Request('http://host/api/cpq/read', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(message),
+    }))).rejects.toMatchObject({ status: 401 })
+    expect(exact).not.toHaveBeenCalled()
+    expect(unary).not.toHaveBeenCalled()
+    await dispose()
+  })
+
+  it('preserves empty request contexts in legacy mode', async () => {
+    const root = new Context()
+    const connection = new HostConnectionService(root, [], {} as BrowserAuth)
+    const direct = vi.fn(() => 'legacy')
+    expect(connection.runWithRequestContext({}, direct)).toBe('legacy')
+    expect(direct).toHaveBeenCalledOnce()
+  })
 })
