@@ -1,9 +1,11 @@
+import { createHash } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { Readable } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import { PrincipalAuthenticationError } from '@deepseek-ai/dsh-principal'
 import { exportJWK, generateKeyPair, SignJWT, type CryptoKey } from 'jose'
 import { calculatePKCECodeChallenge, customFetch, type Configuration } from 'openid-client'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { OidcPrincipalProvider, type Config } from '../src/index.ts'
 
 const APP_ORIGIN = 'http://127.0.0.1:47891'
@@ -145,7 +147,13 @@ class MockIssuer {
     return { entered: entered.promise, release: () => { released.resolve(undefined) } }
   }
 
-  async logoutToken(input: { sid?: string; sub?: string; audience?: string; jti: string }): Promise<string> {
+  async logoutToken(input: {
+    sid?: string
+    sub?: string
+    audience?: string
+    jti: string
+    issuedAt?: number
+  }): Promise<string> {
     return new SignJWT({
       ...(input.sid === undefined ? {} : { sid: input.sid }),
       events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
@@ -153,7 +161,7 @@ class MockIssuer {
       .setProtectedHeader({ alg: 'RS256', kid: 'primary', typ: 'logout+jwt' })
       .setIssuer(this.issuer)
       .setAudience(input.audience ?? 'dsh-browser')
-      .setIssuedAt()
+      .setIssuedAt(input.issuedAt)
       .setJti(input.jti)
       .setSubject(input.sub ?? 'alice')
       .sign(this.privateKey)
@@ -341,6 +349,27 @@ async function activeSession(provider: OidcPrincipalProvider) {
   const cookie = responseCookie(callback, 'dsh_oidc_session')
   const context = await provider.authenticate({ url: '/api', headers: { host: APP_HOST, cookie } })
   return { callback, cookie, context }
+}
+
+function logoutTokenIds(provider: OidcPrincipalProvider): Map<string, number> {
+  return Reflect.get(provider, 'logoutTokenIds') as Map<string, number>
+}
+
+function logoutTargets(provider: OidcPrincipalProvider): Map<string, { readonly issuedAt: number; readonly expiresAt: number }> {
+  return Reflect.get(provider, 'logoutTargets') as Map<
+    string,
+    { readonly issuedAt: number; readonly expiresAt: number }
+  >
+}
+
+async function postBackchannelLogout(provider: OidcPrincipalProvider, logoutToken: string): Promise<TestResponse> {
+  const body = new URLSearchParams({ logout_token: logoutToken }).toString()
+  const request = Readable.from([body]) as IncomingMessage
+  request.method = 'POST'
+  request.headers = { 'content-type': 'application/x-www-form-urlencoded' }
+  const response = new TestResponse()
+  await provider.handleBackchannelLogout(request, response as unknown as ServerResponse)
+  return response
 }
 
 describe('OIDC Principal provider', () => {
@@ -565,17 +594,120 @@ describe('OIDC Principal provider', () => {
     await expect(provider.processBackchannelLogout(logoutToken)).rejects.toThrow('replayed')
   })
 
-  it('stores a bounded hash of back-channel logout token ids', async () => {
-    const provider = await createProvider({ maxSessions: 1 })
-    for (const jti of ['raw-jti-1', 'raw-jti-2', 'raw-jti-3']) {
-      await provider.processBackchannelLogout(await issuer.logoutToken({ sid: 'sid-1', jti }))
+  it('retains replay hashes for every instant when the original logout token remains valid', async () => {
+    const provider = await createProvider()
+    await provider.processBackchannelLogout(await issuer.logoutToken({ sid: 'jwks-warmup', jti: 'jwks-warmup' }))
+    logoutTokenIds(provider).clear()
+    logoutTargets(provider).clear()
+
+    const issuedAt = Math.floor(Date.now() / 1_000)
+    const age301 = await issuer.logoutToken({ sid: 'age-301', jti: 'age-301', issuedAt })
+    const age330 = await issuer.logoutToken({ sid: 'age-330', jti: 'age-330', issuedAt })
+    const age331 = await issuer.logoutToken({ sid: 'age-331', jti: 'age-331', issuedAt })
+    const futureBoundary = await issuer.logoutToken({
+      sid: 'future-boundary',
+      jti: 'future-boundary',
+      issuedAt: issuedAt + 30,
+    })
+    const futureRejected = await issuer.logoutToken({
+      sid: 'future-rejected',
+      jti: 'future-rejected',
+      issuedAt: issuedAt + 31,
+    })
+
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(issuedAt * 1_000)
+      await provider.processBackchannelLogout(age301)
+      await provider.processBackchannelLogout(age330)
+      await provider.processBackchannelLogout(futureBoundary)
+      await expect(provider.processBackchannelLogout(futureRejected)).rejects.toThrow(/should be in the past/u)
+
+      const futureId = createHash('sha256').update('future-boundary').digest('base64url')
+      expect(logoutTokenIds(provider).get(futureId)).toBeGreaterThanOrEqual((issuedAt + 361) * 1_000)
+
+      vi.setSystemTime((issuedAt + 301) * 1_000)
+      await expect(provider.processBackchannelLogout(age301)).rejects.toThrow('logout token replayed')
+      vi.setSystemTime((issuedAt + 330) * 1_000)
+      await expect(provider.processBackchannelLogout(age330)).rejects.toThrow('logout token replayed')
+      vi.setSystemTime((issuedAt + 331) * 1_000)
+      await expect(provider.processBackchannelLogout(age331)).rejects.toThrow(/too far in the past/u)
+    } finally {
+      vi.useRealTimers()
     }
-    const ids = Reflect.get(provider, 'logoutTokenIds') as Map<string, number>
+  })
+
+  it('rejects new logout tokens when replay capacity is full without evicting prior hashes', async () => {
+    const provider = await createProvider({ maxSessions: 1 })
+    const retainedTokens = await Promise.all(([
+      ['retained-target-1', 'retained-1'],
+      ['retained-target-2', 'retained-2'],
+    ] as const).map(([sid, jti]) => (
+      issuer.logoutToken({ sid, jti })
+    )))
+    for (const token of retainedTokens) {
+      await provider.processBackchannelLogout(token)
+    }
+    const ids = logoutTokenIds(provider)
+    const targets = logoutTargets(provider)
+    const idsBefore = [...ids]
+    const targetsBefore = [...targets]
+
+    const rejected = await issuer.logoutToken({ sid: 'retained-target-1', jti: 'capacity-direct' })
+    await expect(provider.processBackchannelLogout(rejected)).rejects.toMatchObject({
+      code: 'principal-unavailable',
+      status: 503,
+      message: 'back-channel logout capacity unavailable',
+    })
+    const routeRejected = await issuer.logoutToken({ sid: 'retained-target-1', jti: 'capacity-route' })
+    expect((await postBackchannelLogout(provider, routeRejected)).status).toBe(503)
+
+    expect([...ids]).toEqual(idsBefore)
+    expect([...targets]).toEqual(targetsBefore)
     expect(ids.size).toBe(2)
-    expect([...ids.keys()]).toEqual(expect.not.arrayContaining(['raw-jti-1', 'raw-jti-2', 'raw-jti-3']))
-    expect([...ids.keys()]).toEqual(expect.arrayContaining([
-      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/u),
-    ]))
+    for (const token of retainedTokens) {
+      await expect(provider.processBackchannelLogout(token)).rejects.toThrow('logout token replayed')
+    }
+  })
+
+  it('rejects a new target at tombstone capacity with no replay or session side effects', async () => {
+    const provider = await createProvider({ maxSessions: 1 })
+    for (const [sid, jti] of [
+      ['retained-target-1', 'target-token-1'],
+      ['retained-target-2', 'target-token-2'],
+    ] as const) {
+      await provider.processBackchannelLogout(await issuer.logoutToken({ sid, jti }))
+    }
+    const ids = logoutTokenIds(provider)
+    const targets = logoutTargets(provider)
+    ids.clear()
+    const targetsBefore = [...targets]
+    const session = await activeSession(provider)
+
+    const rejected = await issuer.logoutToken({ sid: 'sid-1', jti: 'target-capacity' })
+    await expect(provider.processBackchannelLogout(rejected)).rejects.toMatchObject({
+      code: 'principal-unavailable',
+      status: 503,
+    })
+
+    expect([...ids]).toEqual([])
+    expect([...targets]).toEqual(targetsBefore)
+    expect(targets.has('sid\0sid-1')).toBe(false)
+    expect(session.context.invalidated.aborted).toBe(false)
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: APP_HOST, cookie: session.cookie },
+    })).resolves.toBe(session.context)
+  })
+
+  it('stores only one fixed-length hash for a very long logout token id', async () => {
+    const provider = await createProvider({ maxSessions: 1 })
+    const jti = 'raw-jti-'.repeat(1_000)
+    await provider.processBackchannelLogout(await issuer.logoutToken({ sid: 'sid-1', jti }))
+    const ids = logoutTokenIds(provider)
+    expect(ids.size).toBe(1)
+    expect([...ids.keys()]).toEqual([expect.stringMatching(/^[A-Za-z0-9_-]{43}$/u)])
+    expect([...ids.keys()].some(id => id.includes('raw-jti'))).toBe(false)
   })
 
   it('maps an unavailable remote JWKS to Principal provider unavailability', async () => {

@@ -50,6 +50,7 @@ const DEFAULT_BACKCHANNEL_LOGOUT_PATH = '/.dsh/oidc/backchannel-logout'
 const MAX_BACKCHANNEL_BODY_BYTES = 16 * 1024
 const CLOCK_TOLERANCE_SECONDS = 30
 const BACKCHANNEL_MAX_AGE_SECONDS = 5 * 60
+const BACKCHANNEL_REPLAY_RETENTION_SECONDS = BACKCHANNEL_MAX_AGE_SECONDS + CLOCK_TOLERANCE_SECONDS + 1
 const MAX_REVALIDATE_INTERVAL_SECONDS = 60
 const MIN_STREAM_REVALIDATE_INTERVAL_MS = 1_000
 const MAX_LOGOUT_TOKEN_IDS = 20_000
@@ -496,13 +497,8 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     if (sid !== undefined) logoutTarget = logoutTargetKey('sid', sid)
     else if (subject !== undefined) logoutTarget = logoutTargetKey('sub', subject)
     else throw new Error('logout token has no session target')
-    this.cleanupLogoutTokenIds()
     const tokenId = logoutTokenId(payload.jti)
-    if (this.logoutTokenIds.has(tokenId)) throw new Error('logout token replayed')
-    const maximum = Math.min(MAX_LOGOUT_TOKEN_IDS, Math.max(2, this.options.maxSessions * 2))
-    this.makeRoom(this.logoutTokenIds, maximum)
-    this.logoutTokenIds.set(tokenId, Date.now() + BACKCHANNEL_MAX_AGE_SECONDS * 1_000)
-    this.rememberLogoutTarget(logoutTarget, payload.iat)
+    this.recordBackchannelLogout(tokenId, logoutTarget, payload.iat)
 
     for (const [sessionId, session] of [...this.sessions]) {
       const matches = sid === undefined ? session.subject === subject : session.sid === sid
@@ -614,8 +610,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     }
   }
 
-  private cleanupLogoutTokenIds(): void {
-    const now = Date.now()
+  private cleanupLogoutTokenIds(now = Date.now()): void {
     for (const [id, expiresAt] of this.logoutTokenIds) {
       if (expiresAt <= now) this.logoutTokenIds.delete(id)
     }
@@ -633,24 +628,33 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     }
   }
 
-  private rememberLogoutTarget(key: string, issuedAt: number): void {
-    this.cleanupLogoutTargets()
+  private recordBackchannelLogout(tokenId: string, key: string, issuedAt: number): void {
+    const now = Date.now()
+    this.cleanupLogoutTokenIds(now)
+    this.cleanupLogoutTargets(now)
+    if (this.logoutTokenIds.has(tokenId)) throw new Error('logout token replayed')
+
     const previous = this.logoutTargets.get(key)
-    const expiresAt = Date.now()
-      + this.options.transactionTtlMs
-      + (BACKCHANNEL_MAX_AGE_SECONDS + CLOCK_TOLERANCE_SECONDS) * 1_000
-    const tombstone: LogoutTargetTombstone = {
-      issuedAt: Math.max(issuedAt, previous?.issuedAt ?? issuedAt),
-      expiresAt: Math.max(expiresAt, previous?.expiresAt ?? expiresAt),
+    const tokenCapacity = Math.min(MAX_LOGOUT_TOKEN_IDS, Math.max(2, this.options.maxSessions * 2))
+    const targetCapacity = Math.min(MAX_LOGOUT_TARGET_TOMBSTONES, Math.max(2, this.options.maxSessions * 2))
+    if (this.logoutTokenIds.size >= tokenCapacity
+      || (previous === undefined && this.logoutTargets.size >= targetCapacity)) {
+      throw new PrincipalAuthenticationError(
+        'principal-unavailable',
+        503,
+        'back-channel logout capacity unavailable',
+      )
     }
-    this.logoutTargets.delete(key)
-    const maximum = Math.min(MAX_LOGOUT_TARGET_TOMBSTONES, Math.max(2, this.options.maxSessions * 2))
-    this.makeRoom(this.logoutTargets, maximum)
-    this.logoutTargets.set(key, tombstone)
+
+    const tokenExpiresAt = backchannelReplayExpiresAt(issuedAt, now)
+    this.logoutTokenIds.set(tokenId, tokenExpiresAt)
+    this.logoutTargets.set(key, {
+      issuedAt: Math.max(issuedAt, previous?.issuedAt ?? issuedAt),
+      expiresAt: Math.max(tokenExpiresAt + this.options.transactionTtlMs, previous?.expiresAt ?? 0),
+    })
   }
 
-  private cleanupLogoutTargets(): void {
-    const now = Date.now()
+  private cleanupLogoutTargets(now = Date.now()): void {
     for (const [key, tombstone] of this.logoutTargets) {
       if (tombstone.expiresAt <= now) this.logoutTargets.delete(key)
     }
@@ -955,6 +959,11 @@ function logoutTargetKey(kind: 'sid' | 'sub', value: string): string {
 
 function logoutTokenId(jti: string): string {
   return createHash('sha256').update(jti).digest('base64url')
+}
+
+function backchannelReplayExpiresAt(issuedAt: number, processedAt: number): number {
+  const retentionMs = BACKCHANNEL_REPLAY_RETENTION_SECONDS * 1_000
+  return Math.max((issuedAt + BACKCHANNEL_REPLAY_RETENTION_SECONDS) * 1_000, processedAt + retentionMs)
 }
 
 function requireNonEmpty(value: string, label: string): void {
