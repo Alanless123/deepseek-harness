@@ -3,7 +3,11 @@ import { once } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket, { type RawData } from 'ws'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
+import {
+  apply as applyConnection,
+  inject as connectionInject,
+  type ConnectionConfig,
+} from '@deepseek-ai/dsh-client-connection'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import {
@@ -47,7 +51,7 @@ function browserCookie(ctx: Context): string {
   const origin = `http://127.0.0.1:${String(ctx.webServer.port)}`
   const target = new URL(ctx.connection.authenticatedUrl(origin))
   let setCookie: string | undefined
-  ctx.connection.authorizeIndex({
+  void ctx.connection.authorizeIndex({
     method: 'GET',
     url: `${target.pathname}${target.search}`,
     headers: { host: target.host },
@@ -987,11 +991,25 @@ describe('Typert Remote streams', () => {
     rejected.resume()
     ;(request as { abort(): void }).abort()
   })
+
+  it('answers required Principal mode without a provider with 503 before opening a stream', async () => {
+    const { ctx } = await setup(true, {}, { principalMode: 'required' })
+    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`)
+    socket.on('error', () => {})
+    const responseEvent: unknown[] = await once(socket, 'unexpected-response')
+    const request = responseEvent[0]
+    const response = responseEvent[1]
+    const rejected = response as { statusCode?: number; resume(): void }
+    expect(rejected.statusCode).toBe(503)
+    rejected.resume()
+    ;(request as { abort(): void }).abort()
+  })
 })
 
 async function setup(
   transport: boolean,
   gatewayConfig: GatewayConfig = {},
+  connectionConfig: ConnectionConfig = {},
 ): Promise<{ readonly ctx: Context; readonly service: FeedService }> {
   const ctx = new Context()
   roots.push(ctx)
@@ -1002,7 +1020,7 @@ async function setup(
   await ctx.plugin(TypertRegistry)
   await ctx.plugin(TypertGatewayService, gatewayConfig)
   if (transport) {
-    await ctx.plugin({ inject: [...connectionInject], apply: applyConnection })
+    await ctx.plugin({ inject: [...connectionInject], apply: applyConnection }, connectionConfig)
   }
   await ctx.plugin(FeedService)
   ctx.typert.register({

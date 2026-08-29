@@ -174,7 +174,7 @@ async function serveRoute(route: WebRoute): Promise<{ readonly origin: string; c
 function browserCookie(connection: HostConnectionHandle, origin: string): string {
   const target = new URL(connection.authenticatedUrl(origin))
   let setCookie: string | undefined
-  connection.authorizeIndex({
+  void connection.authorizeIndex({
     method: 'GET',
     url: `${target.pathname}${target.search}`,
     headers: { host: target.host },
@@ -1038,6 +1038,24 @@ describe('TypertGatewayService', () => {
       ok: false,
       error: { code: 'internal', message: 'non-error failure', details: {} },
     })
+
+    for (const [status, code, message] of [
+      [401, 'unauthenticated', 'authenticated Principal is required'],
+      [403, 'forbidden', 'project access is forbidden'],
+      [503, 'identity-unavailable', 'identity provider is unavailable'],
+    ] as const) {
+      const authorizationError = new Error(`sensitive authorization failure ${String(status)}`) as Error & { status: number }
+      authorizationError.status = status
+      service.businessError = authorizationError
+      await expect(handler(
+        'goals/fail',
+        { args: { request: null } },
+        new AbortController().signal,
+      )).resolves.toEqual({
+        ok: false,
+        error: { code, message, details: { status } },
+      })
+    }
 
     // A business rejection observed while the carrier signal is already aborted
     // is the caller's cancellation, not an internal gateway fault.

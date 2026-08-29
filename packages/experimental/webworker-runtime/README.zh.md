@@ -47,6 +47,7 @@ kind: "package-library"
 
 <a id="known-limitations-and-deferred-work"></a>
 
+- **页面拥有的载体不支持 required Principal 模式**：postMessage 隧道没有可传播的已认证物理请求或 WebSocket 上下文。当 Connection 报告 `principalMode: required` 时，unary 直连回退、特权方法和 logical stream 会以身份不可用结束，不进入对应 handler；OIDC 部署应使用 Node Host。
 - **worker 组合写明文会话日志**（`compression: 'none'` boot patch）：不带 Zstandard 编解码器，导出日志是 `.jsonl`，不会是 `.jsonl.zstd`。
 - **`node:dns/promises`、`node:vm`、`node:net`、`node:sqlite`、`node:worker_threads` 是结构化 stub**：每次调用在 console 报告拒绝并抛出。需要原生 DNS、真进程或真 realm 隔离的行在此无法运行。
 - **文件 watcher 只能观察已挂载的 VFS**：镜像 seed 不产生事件，VFS 也没有符号链接或外部写入方。`persistent`、`ref()` 和 `unref()` 保留 Node API，但浏览器没有引用计数事件循环，因此这些接口不能控制 dedicated Worker 的生存期。

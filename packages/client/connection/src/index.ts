@@ -21,6 +21,9 @@ export type {
   ConnectionRpcFailure,
   ConnectionRpcHandler,
   ConnectionRequestRejection,
+  ConnectionRequestAuthentication,
+  ConnectionRequestContext,
+  ConnectionPrincipal,
   ConnectionRpcResult,
   ConnectionTrustRequest,
   ClientRequest,
@@ -81,12 +84,15 @@ export interface ConnectionConfig {
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /** Require a Host Principal provider instead of the legacy launch-token browser session. */
+  principalMode?: 'legacy' | 'required'
 }
 
 export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  principalMode: z.union([z.const('legacy'), z.const('required')]).default('legacy'),
 })
 
 /**
@@ -101,6 +107,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const trustedHosts = config?.trustedHosts ?? []
   const cookieMaxAgeDays = config?.cookieMaxAgeDays ?? 30
   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+  const principalMode = config?.principalMode ?? 'legacy'
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
@@ -109,23 +116,39 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
     ctx,
     trustedHosts,
     await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    {
+      principalMode,
+      principalProvider: () => ctx.get('principalProvider'),
+      principals: () => ctx.get('principals'),
+    },
   )
   const fetchHandler = connection.createSharedFetchHandler(API_PATH)
   const route: WebRoute = {
     kind: 'prefix',
     path: API_PATH,
     handler: async (req, res) => {
-      const rejection = connection.requestRejection(req)
-      if (rejection !== undefined) {
-        res.writeHead(rejection)
-        res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+      const authentication = await connection.authenticateRequest(req)
+      if (!authentication.ok) {
+        res.writeHead(authentication.rejection)
+        res.end(rejectionBody(authentication.rejection))
         return
       }
-      await bridge(req, res, fetchHandler, maxRequestBodyBytes)
+      await bridge(req, res, {
+        fetch: request => connection.runWithRequestContext(
+          authentication.context,
+          () => fetchHandler.fetch(request, authentication.context),
+        ),
+      }, maxRequestBodyBytes)
     },
   }
   ctx.effect(() => ctx.webServer.register(route), 'client-connection: /api route')
   ctx.inject(['attachments'], (attachmentCtx) => {
     assertImageBodyCapacity(attachmentCtx, maxRequestBodyBytes)
   })
+}
+
+function rejectionBody(status: 401 | 403 | 503): string {
+  if (status === 401) return 'unauthorized'
+  if (status === 403) return 'forbidden'
+  return 'identity provider unavailable'
 }

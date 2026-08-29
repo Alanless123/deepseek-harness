@@ -28,7 +28,7 @@ import type { AlsCausality } from './polyfill/async-context/als-runtime.ts'
 import { dirname, join } from './module-system/posix-path.ts'
 import { installProcessGlobal } from './node/globals/process.ts'
 import type { RequestListener } from './transport/synthetic-http.ts'
-import { TunnelServer, type TunnelPort } from './transport/tunnel.ts'
+import { SYNTHETIC_HOST, TunnelServer, type TunnelPort } from './transport/tunnel.ts'
 import { inflateImage, inflateImageStream } from './storage/image-gzip.ts'
 import { loadVfsImage, loadVfsOverlay, MemoryVfs } from './storage/memory.ts'
 import { setActiveVfs } from './storage/active.ts'
@@ -258,6 +258,12 @@ export function createWorkerHost(options: WorkerHostOptions): WorkerHost {
         bootPayload: () => readBootPayload(ctx),
         openStream: typertGateway.wireStream.open,
         streamFailure: typertGateway.wireStream.failure,
+        // The synchronous probe returns 503 precisely when Connection requires
+        // asynchronous Principal authentication. A worker-owned postMessage
+        // carrier has no authenticated physical stream context to propagate.
+        allowUnauthenticatedOwnedPageBypass: connection.requestRejection({
+          headers: { host: SYNTHETIC_HOST },
+        }) !== 503,
       })
     } catch (reason) {
       tunnel.fail(reason)

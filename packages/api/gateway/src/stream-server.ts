@@ -3,6 +3,7 @@
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
+import type { ConnectionRequestContext } from '@deepseek-ai/dsh-client-connection'
 import {
   parseRemoteStreamClientMessage,
   type RemoteStreamFailure,
@@ -14,10 +15,13 @@ export type RemoteStreamOpener = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
+  context: ConnectionRequestContext,
 ) => Promise<AsyncIterable<unknown>>
 
 /** Convert an invocation or carrier failure to a stable wire value. */
 export type RemoteStreamFailureMapper = (error: unknown) => RemoteStreamFailure
+/** Revalidate the Host Principal bound to one accepted WebSocket generation. */
+export type RemoteStreamPrincipalRevalidator = (context: ConnectionRequestContext) => Promise<void>
 
 /** Own the no-server WebSocket acceptor and every active logical stream. */
 export class RemoteStreamMuxServer {
@@ -34,6 +38,7 @@ export class RemoteStreamMuxServer {
     private readonly open: RemoteStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
     private readonly heartbeatIntervalMs: number,
+    private readonly revalidate?: RemoteStreamPrincipalRevalidator,
   ) {}
 
   /**
@@ -41,11 +46,18 @@ export class RemoteStreamMuxServer {
    * @param req - authenticated HTTP upgrade request.
    * @param socket - carrier socket transferred to the WebSocket server.
    * @param head - bytes already read after the HTTP upgrade headers.
+   * @param context - Host-authenticated request context bound to this generation.
    */
-  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, context: ConnectionRequestContext = {}): void {
     this.server.handleUpgrade(req, socket, head, (websocket) => {
       this.startHeartbeat()
-      const connection = new RemoteStreamMuxConnection(websocket, this.open, this.failure)
+      const connection = new RemoteStreamMuxConnection(
+        websocket,
+        this.open,
+        this.failure,
+        context,
+        this.revalidate,
+      )
       const done = connection.run()
       this.connections.add(done)
       void done.then(() => { this.connections.delete(done) })
@@ -91,9 +103,12 @@ class RemoteStreamMuxConnection {
     private readonly socket: WebSocket,
     private readonly open: RemoteStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
+    private readonly context: ConnectionRequestContext,
+    private readonly revalidate?: RemoteStreamPrincipalRevalidator,
   ) {}
 
   async run(): Promise<void> {
+    const invalidate = (): void => { this.socket.close(1008, 'authenticated Principal is no longer active') }
     const closed = new Promise<void>((resolve) => {
       this.socket.once('close', resolve)
       this.socket.once('error', () => { this.socket.terminate() })
@@ -109,10 +124,23 @@ class RemoteStreamMuxConnection {
         }
       })
     })
-    await closed
-    const active = [...this.streams.values()]
-    for (const stream of active) stream.abort.abort(new Error('Remote stream socket closed'))
-    await Promise.all(active.map(stream => stream.done))
+    this.context.invalidated?.addEventListener('abort', invalidate, { once: true })
+    if (this.context.invalidated?.aborted === true) invalidate()
+    const revalidation = this.revalidate === undefined || this.context.revalidateIntervalMs === undefined
+      ? undefined
+      : setInterval(() => {
+        void this.revalidate?.(this.context).catch(invalidate)
+      }, this.context.revalidateIntervalMs)
+    revalidation?.unref()
+    try {
+      await closed
+      const active = [...this.streams.values()]
+      for (const stream of active) stream.abort.abort(new Error('Remote stream socket closed'))
+      await Promise.all(active.map(stream => stream.done))
+    } finally {
+      clearInterval(revalidation)
+      this.context.invalidated?.removeEventListener('abort', invalidate)
+    }
   }
 
   private receive(text: string): void {
@@ -143,7 +171,10 @@ class RemoteStreamMuxConnection {
     active: ActiveStream,
   ): Promise<void> {
     try {
-      const source = await this.open(endpoint, payload, active.abort.signal)
+      const signal = this.context.invalidated === undefined
+        ? active.abort.signal
+        : AbortSignal.any([active.abort.signal, this.context.invalidated])
+      const source = await this.open(endpoint, payload, signal, this.context)
       for await (const value of source) {
         await this.send({ type: 'item', streamId, value })
       }
@@ -194,8 +225,8 @@ function rawText(data: RawData): string {
  * @param socket - carrier socket that receives the HTTP rejection.
  * @param status - authentication or browser-trust rejection status.
  */
-export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403): void {
-  const reason = status === 401 ? 'Unauthorized' : 'Forbidden'
+export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403 | 503): void {
+  const reason = status === 401 ? 'Unauthorized' : status === 403 ? 'Forbidden' : 'Service Unavailable'
   const body = reason.toLowerCase()
   socket.end([
     `HTTP/1.1 ${String(status)} ${reason}`,

@@ -106,7 +106,7 @@ async function mounted(config?: { trustedHosts?: string[] }): Promise<{
 function browserCookie(connection: HostConnectionHandle, authority: string): string {
   const url = new URL(connection.authenticatedUrl(`http://${authority}`))
   const exchanged = fakeResponse()
-  connection.authorizeIndex(
+  void connection.authorizeIndex(
     fakeRequest({ host: authority }, `${url.pathname}${url.search}`),
     exchanged.response,
   )
@@ -436,7 +436,7 @@ describe('connection node half', () => {
     await route.handler(fakePost(harnessHeaders, '/rpc/fail', {
       type: 'client-request', rpcId: 'rpc-fail', method: 'fail', payload: {},
     }), failed.response)
-    expect(failed.state).toMatchObject({ status: 500, body: 'handler failure: Error: handler broke' })
+    expect(failed.state).toMatchObject({ status: 500, body: 'handler failure' })
 
     expect(() => connection.rpc.handle('/api', async () => ({ ok: true, value: null })))
       .toThrow('invalid or reserved RPC channel')

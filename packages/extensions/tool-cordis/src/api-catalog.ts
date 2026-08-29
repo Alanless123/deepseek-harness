@@ -1282,6 +1282,55 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'principalProvider',
+    summary: 'Provider seam implemented by OIDC or another deployment identity authority.',
+    description: 'Provider seam implemented by OIDC or another deployment identity authority.',
+    methods: [
+      {
+        signature: 'abstract authenticate(request: PrincipalRequest): Promise<AuthenticatedPrincipalContext>',
+        description: 'Authenticate one Host request without trusting payload, query, or caller-supplied identity headers.',
+        parameters: [{ name: 'request', description: 'Host-derived request facts.' }],
+        returns: 'the verified Principal context bound to this request.',
+      },
+      {
+        signature: 'abstract authorizeIndex(request: PrincipalRequest, response: PrincipalResponse): Promise<boolean>',
+        description: 'Authenticate an index request or own its login redirect/401 response.',
+        parameters: [{ name: 'request', description: 'Host-derived index request facts.' }, { name: 'response', description: 'Host response used for redirects or failures.' }],
+        returns: 'whether the caller may serve the requested index immediately.',
+      },
+      {
+        signature: 'revalidate(context: AuthenticatedPrincipalContext): Promise<void>',
+        description: 'Revalidate an active context; providers may rotate its invalidation signal on failure.',
+        parameters: [{ name: 'context', description: 'previously authenticated request or stream context.' }],
+      },
+    ],
+  },
+  {
+    key: 'principals',
+    summary: 'AsyncLocalStorage-backed isolation for concurrent Host requests.',
+    description: 'AsyncLocalStorage-backed isolation for concurrent Host requests.',
+    methods: [
+      {
+        signature: 'run<T>(context: AuthenticatedPrincipalContext, callback: () => T): T',
+        description: 'Run work inside one authenticated request context.',
+        parameters: [{ name: 'context', description: 'active Host-authenticated context.' }, { name: 'callback', description: 'work that consumes the request-scoped Principal.' }],
+        returns: 'the callback result.',
+      },
+      {
+        signature: 'current(): AuthenticatedPrincipalContext | undefined',
+        description: 'Read the authenticated context without requiring one.',
+        parameters: [],
+        returns: 'the active context, or `undefined` outside authenticated work.',
+      },
+      {
+        signature: 'require(): AuthenticatedPrincipalContext',
+        description: 'Require an active authenticated context.',
+        parameters: [],
+        returns: 'the active context, failing closed when none is usable.',
+      },
+    ],
+  },
+  {
     key: 'sandbox',
     summary: 'Abstract process-sandbox service.',
     description: 'Abstract process-sandbox service. confine must return enforcing argv or fail closed at wrap or runner-execution time; silent unconfined passthrough is forbidden. Functional probes arbitrate multi-runner chains and may be skipped for a sole candidate, whose own refusal remains the fail-closed end.',
@@ -3519,6 +3568,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type AttachmentId = Branded<\'AttachmentId\'>;',
   },
   {
+    name: 'AuthenticatedPrincipalContext',
+    declaration: 'export interface AuthenticatedPrincipalContext {\n    readonly principal: Principal;\n    readonly expiresAt: number;\n    readonly invalidated: AbortSignal;\n    readonly revalidateIntervalMs: number;\n    readonly sessionId?: string;\n}',
+  },
+  {
     name: 'AuthorizationEntry',
     declaration: 'export interface AuthorizationEntry {\n    key: CredentialKey;\n    label: string;\n    methods: readonly AuthorizationMethod[];\n    inFlight: boolean;\n}',
   },
@@ -4529,6 +4582,22 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'PreToolDecision',
     declaration: 'export type PreToolDecision = {\n    kind: \'allow\';\n} | {\n    kind: \'deny\';\n    reason: string;\n} | {\n    kind: \'ask\';\n    reason?: string;\n};',
+  },
+  {
+    name: 'Principal',
+    declaration: 'export interface Principal {\n    readonly principalId: PrincipalId;\n    readonly issuer: string;\n    readonly subject: string;\n    readonly displayName?: string;\n    readonly email?: string;\n    readonly authenticatedAt: string;\n}',
+  },
+  {
+    name: 'PrincipalId',
+    declaration: 'export type PrincipalId = Branded<\'PrincipalId\'>;',
+  },
+  {
+    name: 'PrincipalRequest',
+    declaration: 'export interface PrincipalRequest {\n    readonly headers: Headers | Readonly<Record<string, string | readonly string[] | undefined>>;\n    readonly method?: string | undefined;\n    readonly url?: string | undefined;\n}',
+  },
+  {
+    name: 'PrincipalResponse',
+    declaration: 'export interface PrincipalResponse {\n    writeHead(status: number, headers?: Readonly<Record<string, string>>): unknown;\n    end(body?: string): unknown;\n}',
   },
   {
     name: 'ProjectionChangeListener',

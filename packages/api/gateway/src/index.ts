@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRequestContext, ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import type { WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import z from '@deepseek-ai/schemastery'
@@ -208,20 +208,30 @@ export class TypertGatewayService extends Service implements TypertGateway {
     })
     ctx.inject(['connection', 'webServer'], (webCtx) => {
       const mux = new RemoteStreamMuxServer(
-        (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+        async (endpoint, payload, signal, context) => webCtx.connection.runWithRequestContext(
+          context,
+          async () => scopedIterable(
+            await this.openWireStream(endpoint, payload, signal),
+            callback => webCtx.connection.runWithRequestContext(context, callback),
+          ),
+        ),
         this.wireStream.failure,
         resolved.websocketHeartbeatIntervalMs,
+        async (context) => {
+          const rejection = await webCtx.connection.revalidateRequest(context)
+          if (rejection !== undefined) throw new Error(`Principal revalidation failed with ${String(rejection)}`)
+        },
       )
       webCtx.effect(() => {
         const route: WebUpgradeRoute = {
           path: REMOTE_STREAM_MUX_PATH,
-          handler: (req, socket, head) => {
-            const rejection = webCtx.connection.requestRejection(req)
-            if (rejection !== undefined) {
-              rejectRemoteStreamUpgrade(socket, rejection)
+          handler: async (req, socket, head) => {
+            const authentication = await webCtx.connection.authenticateRequest(req)
+            if (!authentication.ok) {
+              rejectRemoteStreamUpgrade(socket, authentication.rejection)
               return
             }
-            mux.handleUpgrade(req, socket, head)
+            mux.handleUpgrade(req, socket, head, authentication.context)
           },
         }
         const unregister = webCtx.webServer.registerUpgrade(route)
@@ -357,6 +367,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    _context?: ConnectionRequestContext,
   ): Promise<ConnectionRpcResult> {
     if (endpoint === REMOTE_EVENT_RESULT_ENDPOINT) {
       try {
@@ -880,6 +891,26 @@ export class TypertGatewayService extends Service implements TypertGateway {
   }
 }
 
+function scopedIterable<T>(source: AsyncIterable<T>, run: <Value>(callback: () => Value) => Value): AsyncIterable<T> {
+  return {
+    [Symbol.asyncIterator]() {
+      const iterator = source[Symbol.asyncIterator]()
+      const scoped: AsyncIterator<T, undefined, undefined> = {
+        next: () => run(async () => {
+          const result = await iterator.next()
+          if (result.done === true) return { done: true as const, value: undefined }
+          return { done: false as const, value: result.value }
+        }),
+        return: () => run(async () => {
+          await iterator.return?.()
+          return { done: true as const, value: undefined }
+        }),
+      }
+      return scoped
+    },
+  }
+}
+
 type RemoteEventWireFrame =
   | RemoteEventEmitFrame
   | RemoteEventInvocationFrame
@@ -1007,6 +1038,17 @@ function rpcFailure(error: unknown): ConnectionRpcResult {
   if (error instanceof TypertRemoteFailure) {
     return { ok: false, error: error.failure }
   }
+  const status = authorizationStatus(error)
+  if (status !== undefined) {
+    return {
+      ok: false,
+      error: {
+        code: status === 401 ? 'unauthenticated' : status === 403 ? 'forbidden' : 'identity-unavailable',
+        message: status === 401 ? 'authenticated Principal is required' : status === 403 ? 'project access is forbidden' : 'identity provider is unavailable',
+        details: { status },
+      },
+    }
+  }
   return {
     ok: false,
     error: {
@@ -1015,6 +1057,12 @@ function rpcFailure(error: unknown): ConnectionRpcResult {
       details: {},
     },
   }
+}
+
+function authorizationStatus(error: unknown): 401 | 403 | 503 | undefined {
+  if (typeof error !== 'object' || error === null || !('status' in error)) return undefined
+  const status = (error as { readonly status?: unknown }).status
+  return status === 401 || status === 403 || status === 503 ? status : undefined
 }
 
 function rpcError(error: unknown): ConnectionRpcError & RemoteStreamFailure {

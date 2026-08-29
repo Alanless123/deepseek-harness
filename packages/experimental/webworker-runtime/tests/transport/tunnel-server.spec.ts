@@ -21,6 +21,7 @@ function seams(openStream: TunnelSeams['openStream']): TunnelSeams {
       message: error instanceof Error ? error.message : String(error),
       details: { fixture: true },
     }),
+    allowUnauthenticatedOwnedPageBypass: true,
   }
 }
 
@@ -57,6 +58,62 @@ describe('worker tunnel unary authentication', () => {
     if (frame?.t !== 'res' || frame.body === undefined) throw new Error('direct retry did not return one body')
     expect(new TextDecoder().decode(frame.body)).toBe('direct answer')
     expect(directFetch).toHaveBeenCalledOnce()
+  })
+
+  it('does not retry a route-lane 503 through the direct lane', async () => {
+    const frames: TunnelOutboundFrame[] = []
+    const directFetch = vi.fn(async () => new Response('unexpected direct answer'))
+    const server = new TunnelServer({
+      port: { postMessage: (frame) => { frames.push(frame) } },
+      requestListener: () => Promise.resolve((_req, response) => {
+        const res = response as { writeHead(status: number): void; end(body: string): void }
+        res.writeHead(503)
+        res.end('identity provider unavailable')
+      }),
+    })
+    server.serve({
+      ...seams(async () => (async function *(): AsyncGenerator { yield undefined })()),
+      directFetch,
+    })
+
+    server.handleMessage({
+      t: 'req', id: 503, method: 'POST', url: 'http://localhost/api/session/list', headers: {},
+    })
+
+    await vi.waitFor(() => { expect(frames).toHaveLength(1) })
+    expect(frames[0]).toMatchObject({ t: 'res', id: 503, status: 503 })
+    expect(directFetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a route-lane 401 retry', {}],
+    ['the configured direct lane', { unaryApiLane: 'direct' as const }],
+    ['a privileged method', { privilegedMethods: new Set(['session/list']) }],
+  ])('fails %s closed when Principal authentication owns the carrier', async (_label, options) => {
+    const frames: TunnelOutboundFrame[] = []
+    const directFetch = vi.fn(async () => new Response('unexpected direct answer'))
+    const server = new TunnelServer({
+      port: { postMessage: (frame) => { frames.push(frame) } },
+      requestListener: () => Promise.resolve((_req, response) => {
+        const res = response as { writeHead(status: number): void; end(body: string): void }
+        res.writeHead(401)
+        res.end('login required')
+      }),
+      ...options,
+    })
+    server.serve({
+      ...seams(async () => (async function *(): AsyncGenerator { yield undefined })()),
+      directFetch,
+      allowUnauthenticatedOwnedPageBypass: false,
+    })
+
+    server.handleMessage({
+      t: 'req', id: 504, method: 'POST', url: 'http://localhost/api/session/list', headers: {},
+    })
+
+    await vi.waitFor(() => { expect(frames).toHaveLength(1) })
+    expect(frames[0]).toMatchObject({ t: 'res', id: 504, status: 503 })
+    expect(directFetch).not.toHaveBeenCalled()
   })
 })
 
@@ -132,6 +189,35 @@ describe('worker tunnel logical streams', () => {
         },
       }])
     })
+  })
+
+  it('refuses Principal-required streams before the worker-local opener', async () => {
+    const { server, frames } = harness()
+    const openStream = vi.fn(async () => (async function *(): AsyncGenerator { yield 'unexpected' })())
+    server.serve({
+      ...seams(openStream),
+      allowUnauthenticatedOwnedPageBypass: false,
+      streamFailure: error => ({
+        code: (error as { status?: number }).status === 503 ? 'identity-unavailable' : 'unexpected',
+        message: error instanceof Error ? error.message : String(error),
+        details: { status: (error as { status?: number }).status },
+      }),
+    })
+    server.handleMessage({ t: 'stream-open', id: 6, endpoint: 'session/follow', payload: {} })
+
+    await vi.waitFor(() => {
+      expect(frames).toEqual([{
+        t: 'stream-error',
+        id: 6,
+        failure: {
+          kind: 'remote',
+          code: 'identity-unavailable',
+          message: 'authenticated Principal transport is unavailable',
+          details: { status: 503 },
+        },
+      }])
+    })
+    expect(openStream).not.toHaveBeenCalled()
   })
 
   it('refuses queued and future streams after boot failure as carrier failures', () => {

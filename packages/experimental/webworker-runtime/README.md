@@ -47,6 +47,7 @@ None; this package neither assembles nor sends a provider request.
 
 <a id="known-limitations-and-deferred-work"></a>
 
+- **Required Principal mode is unsupported by the page-owned carrier**: the postMessage tunnel has no authenticated physical request or WebSocket context to propagate. When Connection reports `principalMode: required`, unary direct fallback, privileged methods, and logical streams return identity-unavailable without entering their handlers; use a Node Host for OIDC deployments.
 - **The worker composition writes plaintext session logs** (`compression: 'none'` boot patch): it carries no Zstandard codec, so exported logs are `.jsonl`, never `.jsonl.zstd`.
 - **`node:dns/promises`, `node:vm`, `node:net`, `node:sqlite`, `node:worker_threads` are structural stubs**: every call reports its refusal on the console and throws. Rows needing native DNS, a real process, or realm isolation cannot run here.
 - **Filesystem watchers observe only the mounted VFS**: image seeding is silent and the VFS has no symlinks or external writers. `persistent`, `ref()`, and `unref()` preserve the Node API but cannot control a dedicated Worker's lifetime because browsers expose no ref-counted event loop.

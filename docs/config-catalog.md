@@ -426,10 +426,12 @@ export interface ConnectionConfig {
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /** Require a Host Principal provider instead of the legacy launch-token browser session. */
+  principalMode?: 'legacy' | 'required'
 }
 ```
 
-Source: [`packages/client/connection/src/index.ts:70`](../packages/client/connection/src/index.ts)
+Source: [`packages/client/connection/src/index.ts:73`](../packages/client/connection/src/index.ts)
 
 <a id="deepseek-aidsh-client-hmr"></a>
 
@@ -1619,6 +1621,52 @@ export interface Config {
 ```
 
 Source: [`packages/llm/plugin-package-inventory-deepseek/src/index.ts:30`](../packages/llm/plugin-package-inventory-deepseek/src/index.ts)
+
+<a id="deepseek-aidsh-principal-oidc"></a>
+
+## `@deepseek-ai/dsh-principal-oidc`
+
+Requires: `webServer`
+
+```ts config-catalog
+/** OIDC client and in-memory Host session configuration. */
+export interface Config {
+  /** Exact OIDC Issuer Identifier used for discovery and Principal identity. */
+  issuer: string
+  /** Registered OIDC client identifier. */
+  clientId: string
+  /** Exact resource-server audience required on every active access token. */
+  accessTokenAudience: string
+  /** Confidential-client secret. Omit for a public PKCE client. */
+  clientSecret?: string
+  /** Exact registered Authorization Code callback URI. */
+  redirectUri: string
+  /** Exact registered post-logout URI; defaults to the redirect URI origin. */
+  postLogoutRedirectUri?: string
+  /** Requested OIDC scopes. `openid` is always required. */
+  scopes?: string[]
+  /** ID Token and back-channel logout JWS algorithm. */
+  signingAlgorithm?: string
+  /** Cache duration before active access tokens are introspected again. */
+  revalidateIntervalSeconds?: number
+  /** Absolute Host session cap, independent of token expiration. */
+  sessionMaxAgeSeconds?: number
+  /** One-time state/nonce/PKCE transaction lifetime. */
+  transactionTtlSeconds?: number
+  /** Maximum active Host sessions retained in memory. */
+  maxSessions?: number
+  /** Maximum pending login transactions retained in memory. */
+  maxTransactions?: number
+  /** Browser route that starts RP-initiated logout. */
+  logoutPath?: string
+  /** IdP route for signed back-channel logout tokens. */
+  backchannelLogoutPath?: string
+  /** Explicitly permit HTTP only for a loopback development issuer and app. */
+  allowInsecureHttp?: boolean
+}
+```
+
+Source: [`packages/identity/principal-oidc/src/index.ts:58`](../packages/identity/principal-oidc/src/index.ts)
 
 <a id="deepseek-aidsh-pwsh-local"></a>
 
@@ -3461,6 +3509,7 @@ These load from a `cordis.yml` entry with no `config:` block; they declare no co
 - `@deepseek-ai/dsh-host-plugin-inventory` — requires `loader` ([`packages/host/plugin-inventory/src/index.ts`](../packages/host/plugin-inventory/src/index.ts))
 - `@deepseek-ai/dsh-llm` ([`packages/llm/llm/src/index.ts`](../packages/llm/llm/src/index.ts))
 - `@deepseek-ai/dsh-lsp` ([`packages/lsp/lsp/src/index.ts`](../packages/lsp/lsp/src/index.ts))
+- `@deepseek-ai/dsh-principal` ([`packages/identity/principal/src/index.ts`](../packages/identity/principal/src/index.ts))
 - `@deepseek-ai/dsh-schedule` — requires `agents` · `sessions` · `tools` · `sessionPersistence` ([`packages/schedule/schedule/src/index.ts`](../packages/schedule/schedule/src/index.ts))
 - `@deepseek-ai/dsh-session` ([`packages/core/session/src/index.ts`](../packages/core/session/src/index.ts))
 - `@deepseek-ai/dsh-session-checkpoint-policy` — requires `llm` · `sessionPersistence` · `sessions` · `tools` ([`packages/session/session-checkpoint-policy/src/index.ts`](../packages/session/session-checkpoint-policy/src/index.ts))

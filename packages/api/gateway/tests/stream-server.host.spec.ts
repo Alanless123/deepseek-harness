@@ -2,10 +2,12 @@ import { once } from 'node:events'
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
+import type { ConnectionRequestContext } from '@deepseek-ai/dsh-client-connection'
 import {
   RemoteStreamMuxServer,
   type RemoteStreamFailureMapper,
   type RemoteStreamOpener,
+  type RemoteStreamPrincipalRevalidator,
 } from '../src/stream-server.ts'
 
 interface RunningMux {
@@ -185,6 +187,69 @@ describe('Remote stream mux server carrier lifecycle', () => {
     await expect(entry.mux.close()).rejects.toThrow()
     await closeHttp(entry.http)
   })
+
+  it('binds the Host Principal generation and closes active streams when it is invalidated', async () => {
+    const invalidation = new AbortController()
+    const context: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:alice', displayName: 'Alice' },
+      expiresAt: Date.now() + 60_000,
+      invalidated: invalidation.signal,
+      revalidateIntervalMs: 15_000,
+    }
+    let seen: ConnectionRequestContext | undefined
+    let returned!: () => void
+    const didReturn = new Promise<void>((resolve) => { returned = resolve })
+    const entry = await startMux(async (_endpoint, _payload, signal, requestContext) => {
+      seen = requestContext
+      return cleanlyCancelled(signal, returned)
+    }, 30_000, context)
+    const client = await connect(entry.url)
+    client.send(openFrame('principal-bound'))
+    await vi.waitFor(() => { expect(seen?.principal?.principalId).toBe('oidc:v1:alice') })
+    const closed = once(client, 'close')
+    invalidation.abort(new Error('session revoked'))
+    const event = await closed
+    expect(event[0]).toBe(1008)
+    expect(String(event[1])).toBe('authenticated Principal is no longer active')
+    await didReturn
+  })
+
+  it('closes an already-invalid generation and fails closed when periodic revalidation fails', async () => {
+    const invalidation = new AbortController()
+    invalidation.abort(new Error('revoked before upgrade completed'))
+    const context: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:alice' },
+      expiresAt: Date.now() + 60_000,
+      invalidated: invalidation.signal,
+      revalidateIntervalMs: 15_000,
+    }
+    const invalidEntry = await startMux(async (_endpoint, _payload, signal) => waitForAbort(signal), 30_000, context)
+    const invalidClient = new WebSocket(invalidEntry.url)
+    const invalidClosed = once(invalidClient, 'close')
+    await once(invalidClient, 'open')
+    const invalidEvent = await invalidClosed
+    expect(invalidEvent[0]).toBe(1008)
+    expect(String(invalidEvent[1])).toBe('authenticated Principal is no longer active')
+
+    const activeContext: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:bob' },
+      expiresAt: Date.now() + 60_000,
+      invalidated: new AbortController().signal,
+      revalidateIntervalMs: 10,
+    }
+    const revalidate = vi.fn(async () => { throw new Error('identity provider unavailable') })
+    const unavailableEntry = await startMux(
+      async (_endpoint, _payload, signal) => waitForAbort(signal),
+      30_000,
+      activeContext,
+      revalidate,
+    )
+    const unavailableClient = await connect(unavailableEntry.url)
+    const unavailableEvent = await once(unavailableClient, 'close')
+    expect(unavailableEvent[0]).toBe(1008)
+    expect(String(unavailableEvent[1])).toBe('authenticated Principal is no longer active')
+    expect(revalidate).toHaveBeenCalled()
+  })
 })
 
 const mapFailure: RemoteStreamFailureMapper = error => ({
@@ -193,10 +258,15 @@ const mapFailure: RemoteStreamFailureMapper = error => ({
   details: {},
 })
 
-async function startMux(open: RemoteStreamOpener, heartbeatIntervalMs = 30_000): Promise<RunningMux> {
-  const mux = new RemoteStreamMuxServer(open, mapFailure, heartbeatIntervalMs)
+async function startMux(
+  open: RemoteStreamOpener,
+  heartbeatIntervalMs = 30_000,
+  context: ConnectionRequestContext = {},
+  revalidate?: RemoteStreamPrincipalRevalidator,
+): Promise<RunningMux> {
+  const mux = new RemoteStreamMuxServer(open, mapFailure, heartbeatIntervalMs, revalidate)
   const http = createServer()
-  http.on('upgrade', (request, socket, head) => { mux.handleUpgrade(request, socket, head) })
+  http.on('upgrade', (request, socket, head) => { mux.handleUpgrade(request, socket, head, context) })
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject)
     http.listen(0, '127.0.0.1', () => {

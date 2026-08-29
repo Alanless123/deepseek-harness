@@ -60,6 +60,67 @@ A request whose handling throws (a malformed %-escape hitting `decodeURIComponen
 
 Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
 
+<a id="ctxprincipalprovider--principalprovider-abstract-seam"></a>
+
+### `ctx.principalProvider` — `PrincipalProvider` (abstract seam)
+
+Provider seam implemented by OIDC or another deployment identity authority.
+
+```ts cordis-catalog
+/**
+ * Authenticate one Host request without trusting payload, query, or caller-supplied identity headers.
+ * @param request - Host-derived request facts.
+ * @returns the verified Principal context bound to this request.
+ */
+abstract authenticate(request: PrincipalRequest): Promise<AuthenticatedPrincipalContext>
+
+/**
+ * Authenticate an index request or own its login redirect/401 response.
+ * @param request - Host-derived index request facts.
+ * @param response - Host response used for redirects or failures.
+ * @returns whether the caller may serve the requested index immediately.
+ */
+abstract authorizeIndex(request: PrincipalRequest, response: PrincipalResponse): Promise<boolean>
+
+/**
+ * Revalidate an active context; providers may rotate its invalidation signal on failure.
+ * @param context - previously authenticated request or stream context.
+ */
+revalidate(context: AuthenticatedPrincipalContext): Promise<void>
+```
+
+Source: [`packages/identity/principal/src/index.ts`](../../packages/identity/principal/src/index.ts)
+
+<a id="ctxprincipals--principalcontextservice"></a>
+
+### `ctx.principals` — `PrincipalContextService`
+
+AsyncLocalStorage-backed isolation for concurrent Host requests.
+
+```ts cordis-catalog
+/**
+ * Run work inside one authenticated request context.
+ * @param context - active Host-authenticated context.
+ * @param callback - work that consumes the request-scoped Principal.
+ * @returns the callback result.
+ */
+run<T>(context: AuthenticatedPrincipalContext, callback: () => T): T
+
+/**
+ * Read the authenticated context without requiring one.
+ * @returns the active context, or `undefined` outside authenticated work.
+ */
+current(): AuthenticatedPrincipalContext | undefined
+
+/**
+ * Require an active authenticated context.
+ * @returns the active context, failing closed when none is usable.
+ */
+require(): AuthenticatedPrincipalContext
+```
+
+Source: [`packages/identity/principal/src/index.ts`](../../packages/identity/principal/src/index.ts)
+
 <a id="ctxwebserver--webserver"></a>
 
 ### `ctx.webServer` — `WebServer`

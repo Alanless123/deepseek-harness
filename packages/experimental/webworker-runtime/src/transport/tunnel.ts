@@ -4,9 +4,10 @@
  *
  * - `GET /__boot__` answers from tunnel glue, never from the host API surface,
  *   because the page needs the boot payload before its Cordis tree exists.
- * - Privileged `/api` methods take that same direct entry. The method set is not
- *   restated here: a 401 or 403 from the route lane is retried on the direct
- *   lane because the page owns the worker and needs no network authentication.
+ * - Privileged `/api` methods take that same direct entry in legacy browser-auth
+ *   mode. A 401 or 403 from the route lane is retried because the page owns the
+ *   worker, but only while the Host explicitly permits that unauthenticated
+ *   bypass. Principal-required deployments fail closed instead.
  * - Everything else is fed into the real webserver route table through the
  *   request listener the app's fake `node:http` captured, keeping the trust
  *   fences, byte limits, and status semantics intact.
@@ -103,6 +104,8 @@ export interface TunnelSeams {
     readonly message: string
     readonly details: object
   }
+  /** Whether the page-owned legacy carrier may dispatch without Host authentication. */
+  readonly allowUnauthenticatedOwnedPageBypass: boolean
 }
 
 /** Construction inputs for {@link TunnelServer}. */
@@ -226,7 +229,8 @@ export class TunnelServer {
    */
   serve(seams: TunnelSeams): void {
     this.seams = seams
-    console.info(`webworker tunnel: serving (unary /api lane=${this.unaryApiLane}${this.unaryApiLane === 'route' ? ' with 401/403 retry' : ''}, privileged set=${this.privilegedMethods === undefined ? 'none' : String(this.privilegedMethods.size)}, queued=${String(this.queue.length)})`)
+    const bypass = seams.allowUnauthenticatedOwnedPageBypass ? 'allowed' : 'blocked'
+    console.info(`webworker tunnel: serving (unary /api lane=${this.unaryApiLane}${this.unaryApiLane === 'route' ? ' with guarded 401/403 retry' : ''}, owned-page bypass=${bypass}, privileged set=${this.privilegedMethods === undefined ? 'none' : String(this.privilegedMethods.size)}, queued=${String(this.queue.length)})`)
     for (const frame of this.queue.splice(0)) this.dispatchFrame(frame)
   }
 
@@ -276,6 +280,15 @@ export class TunnelServer {
       return
     }
     const seams = this.seams
+    if (!seams.allowUnauthenticatedOwnedPageBypass) {
+      const failure = seams.streamFailure(identityUnavailableError())
+      this.send({
+        t: 'stream-error',
+        id: frame.id,
+        failure: { kind: 'remote', ...failure },
+      })
+      return
+    }
     const controller = new AbortController()
     this.inFlight.set(frame.id, { abort: () => { controller.abort() } })
     try {
@@ -388,6 +401,10 @@ export class TunnelServer {
   ): Promise<void> {
     const method = path.slice(API_PREFIX.length + 1)
     if (this.unaryApiLane === 'direct' || this.privilegedMethods?.has(method) === true) {
+      if (!this.seams?.allowUnauthenticatedOwnedPageBypass) {
+        this.refuseIdentityUnavailable(sink)
+        return
+      }
       await this.serveDirect(original, sink)
       return
     }
@@ -404,11 +421,24 @@ export class TunnelServer {
     // The decision happens at the first frame, before anything reaches the page:
     // the route lane streams its answers, so a refusal can carry a body too.
     if (outcome.status === 401 || outcome.status === 403) {
+      if (!this.seams?.allowUnauthenticatedOwnedPageBypass) {
+        this.refuseIdentityUnavailable(sink)
+        return
+      }
       console.debug(`webworker tunnel: route lane refused ${method} with ${String(outcome.status)}; answering on the direct lane`)
       await this.serveDirect(original, sink)
       return
     }
     buffered.flushTo(sink)
+  }
+
+  private refuseIdentityUnavailable(sink: ResponseSink): void {
+    const body = encoder.encode('identity provider unavailable')
+    sink.end({
+      status: 503,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+      body,
+    })
   }
 
   private serveBoot(frame: TunnelRequestFrame, sink: ResponseSink): void {
@@ -482,4 +512,8 @@ export class TunnelServer {
       reader.releaseLock()
     }
   }
+}
+
+function identityUnavailableError(): Error & { readonly status: 503 } {
+  return Object.assign(new Error('authenticated Principal transport is unavailable'), { status: 503 as const })
 }

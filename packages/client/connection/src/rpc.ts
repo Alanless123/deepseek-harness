@@ -38,6 +38,9 @@ export interface RpcErrorDetailsMap {
   'agent-preset-not-found': { agentPreset: string; available: readonly string[] }
   'agent-preset-invalid': { agentPreset: string; reason: string }
   'agent-busy': { reason: string }
+  'unauthenticated': { status: 401 }
+  'forbidden': { status: 403 }
+  'identity-unavailable': { status: 503 }
   'internal': {}
 }
 
@@ -109,7 +112,28 @@ export interface ConnectionTrustRequest {
 }
 
 /** HTTP status returned before dispatch, or undefined when the request may proceed. */
-export type ConnectionRequestRejection = 401 | 403 | undefined
+export type ConnectionRequestRejection = 401 | 403 | 503 | undefined
+
+/** Safe Host-created identity projection accompanying one authenticated dispatch. */
+export interface ConnectionPrincipal {
+  readonly principalId: string
+  readonly displayName?: string | undefined
+  readonly email?: string | undefined
+}
+
+/** Request context minted by Connection after authentication, never decoded from Browser input. */
+export interface ConnectionRequestContext {
+  readonly principal?: ConnectionPrincipal | undefined
+  readonly expiresAt?: number | undefined
+  readonly invalidated?: AbortSignal | undefined
+  readonly revalidateIntervalMs?: number | undefined
+  readonly sessionId?: string | undefined
+}
+
+/** Result of trust and authentication checks performed before carrier dispatch. */
+export type ConnectionRequestAuthentication =
+  | { readonly ok: true; readonly context: ConnectionRequestContext }
+  | { readonly ok: false; readonly rejection: Exclude<ConnectionRequestRejection, undefined> }
 
 /** Root/index request facts used by the browser-token exchange. */
 export interface ConnectionIndexRequest extends ConnectionTrustRequest {
@@ -128,6 +152,7 @@ export type ConnectionRpcHandler = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
+  context: ConnectionRequestContext,
 ) => Promise<ConnectionRpcResult<unknown>>
 
 /** Synchronous ownership test for one endpoint on a shared RPC channel. */
@@ -143,7 +168,7 @@ export interface ConnectionFetchRoute {
   /** Methods this route owns. Other methods continue through normal shared-channel dispatch. */
   readonly methods: readonly ConnectionFetchMethod[]
   /** Handle one request after the physical carrier has applied its trust and authentication policy. */
-  readonly fetch: (request: Request) => Promise<Response>
+  readonly fetch: (request: Request, context: ConnectionRequestContext) => Promise<Response>
 }
 
 /** Host registry for exact Fetch routes that cannot use JSON Remote invocation. */
@@ -205,13 +230,22 @@ export interface HostConnectionHandle {
    */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
+  /** Authenticate a trusted request and mint its Host-only dispatch context. */
+  authenticateRequest(request: ConnectionTrustRequest): Promise<ConnectionRequestAuthentication>
+
+  /** Revalidate an established Principal generation; undefined means still active. */
+  revalidateRequest(context: ConnectionRequestContext): Promise<ConnectionRequestRejection>
+
+  /** Run one handler inside the authenticated Principal AsyncLocalStorage scope. */
+  runWithRequestContext<T>(context: ConnectionRequestContext, callback: () => T): T
+
   /**
    * Authenticate one frontend index request, owning a token redirect or 401.
    * @param request - root or configured-index HTTP request.
    * @param response - response owned when the result is false.
    * @returns true only when the frontend may serve index.html.
    */
-  authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
+  authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean | Promise<boolean>
 
   /**
    * Add the fresh process token to an ordinary Web application URL.
@@ -228,7 +262,7 @@ export interface ConnectionFetchHandler {
    * @param request - Fetch request below the shared channel.
    * @returns the registered response or a 404 response.
    */
-  fetch(request: Request): Promise<Response>
+  fetch(request: Request, context?: ConnectionRequestContext): Promise<Response>
 }
 
 /** Client caller for logical RPC channels carried by the current transport. */

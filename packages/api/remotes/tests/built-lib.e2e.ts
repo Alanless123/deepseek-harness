@@ -112,14 +112,19 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
         throw new Error('Connection did not register exactly one /api route')
       }
       const server = createServer((request, response) => {
-        if ((request.url ?? '/').startsWith('/?')) {
-          if (host.connection.authorizeIndex(request, response)) {
-            response.writeHead(200, { 'content-type': 'text/html' })
-            response.end('<body>shell</body>')
+        void (async () => {
+          if ((request.url ?? '/').startsWith('/?')) {
+            if (await host.connection.authorizeIndex(request, response)) {
+              response.writeHead(200, { 'content-type': 'text/html' })
+              response.end('<body>shell</body>')
+            }
+            return
           }
-          return
-        }
-        void routes[0].handler(request, response)
+          await routes[0].handler(request, response)
+        })().catch(error => {
+          if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain' })
+          response.end(error instanceof Error ? error.message : String(error))
+        })
       })
       await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
       const address = server.address()
