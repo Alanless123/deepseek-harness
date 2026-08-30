@@ -4,6 +4,7 @@ import {
   parseRemoteStreamServerMessage,
   REMOTE_STREAM_MUX_PATH,
   type RemoteStreamClientMessage,
+  type RemoteStreamHelloMessage,
   type RemoteStreamServerMessage,
 } from '../stream-protocol.ts'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
@@ -12,6 +13,8 @@ const INTERNAL_BASE = 'http://dsh.internal'
 const RECONNECT_BASE_MS = 500
 const RECONNECT_FACTOR = 2
 const RECONNECT_MAX_MS = 10_000
+const AUTHENTICATED_RESUME_WINDOW_MS = 30_000
+const HOST_HELLO_WINDOW_MS = 30_000
 
 /** One Host-reported Remote stream failure. */
 export class RemoteStreamError extends Error {
@@ -46,18 +49,24 @@ export class RemoteStreamCarrierError extends Error {
 }
 
 interface SocketWaiter {
+  readonly expectedBinding?: RemoteStreamHelloMessage
   resolve(socket: WebSocket): void
   reject(error: unknown): void
 }
 
+type RemoteStreamLogicalMessage = Exclude<RemoteStreamServerMessage, RemoteStreamHelloMessage>
+
 /** Keep one physical WebSocket and share it among independently cancellable Remote streams. */
 export class RemoteStreamMuxClient {
   private socket: WebSocket | undefined
-  private cancelCandidate: ((error: Error) => void) | undefined
+  private cancelCandidate: ((error: Error, code?: number, reason?: string) => void) | undefined
   private keepAlive: Promise<void> | undefined
   private keepAliveAbort: AbortController | undefined
   private readonly streams = new Map<string, StreamInbox>()
   private readonly waiters = new Set<SocketWaiter>()
+  private binding: RemoteStreamHelloMessage | undefined
+  private pendingGenerationFailure: RemoteStreamCarrierError | undefined
+  private authenticatedResumeTimer: ReturnType<typeof setTimeout> | undefined
   private running = false
   private disposed = false
 
@@ -129,6 +138,8 @@ export class RemoteStreamMuxClient {
       const error = new Error('api gateway: Remote stream client disposed')
       this.keepAliveAbort?.abort(error)
       this.keepAliveAbort = undefined
+      this.clearAuthenticatedResumeTimer()
+      this.pendingGenerationFailure = undefined
       this.failAll(error)
       for (const waiter of [...this.waiters]) waiter.reject(error)
       this.cancelCandidate?.(error)
@@ -143,27 +154,49 @@ export class RemoteStreamMuxClient {
     const socket = new WebSocket(remoteStreamUrl())
     const connecting = new Promise<WebSocket>((resolve, reject) => {
       let settled = false
-      const rejectCandidate = (error: Error): void => {
+      let physicalOpen = false
+      const helloTimer = setTimeout(() => {
+        rejectCandidate(
+          new RemoteStreamCarrierError('api gateway: Remote stream Host hello timed out'),
+          4002,
+          'Remote stream Host hello timed out',
+        )
+      }, HOST_HELLO_WINDOW_MS)
+      const rejectCandidate = (error: Error, code?: number, reason?: string): void => {
+        if (settled) return
         settled = true
+        clearTimeout(helloTimer)
         socket.removeEventListener('open', opened)
         socket.removeEventListener('error', failed)
         socket.removeEventListener('message', received)
         socket.removeEventListener('close', closed)
         this.cancelCandidate = undefined
-        socket.close()
+        socket.close(code, reason)
         reject(error)
       }
-      const opened = (): void => {
+      const accepted = (hello: RemoteStreamHelloMessage): void => {
+        if (settled) return
         settled = true
+        clearTimeout(helloTimer)
         this.cancelCandidate = undefined
         this.socket = socket
-        for (const waiter of [...this.waiters]) waiter.resolve(socket)
+        this.acceptBinding(hello)
+        for (const waiter of [...this.waiters]) {
+          if (waiter.expectedBinding !== undefined && !canResumeRemoteStreams(waiter.expectedBinding, hello)) {
+            waiter.reject(remoteStreamBindingError())
+          } else {
+            waiter.resolve(socket)
+          }
+        }
         resolve(socket)
       }
+      const opened = (): void => { physicalOpen = true }
       const failed = (): void => {
         if (!settled) {
           rejectCandidate(new RemoteStreamCarrierError(
-            'api gateway: Remote stream WebSocket failed to open',
+            physicalOpen
+              ? 'api gateway: Remote stream WebSocket failed before Host hello'
+              : 'api gateway: Remote stream WebSocket failed to open',
           ))
           return
         }
@@ -171,16 +204,38 @@ export class RemoteStreamMuxClient {
         this.lost(socket, error)
         socket.close()
       }
-      const closed = (): void => {
+      const closed = (event: CloseEvent): void => {
+        const error = remoteStreamCloseError(event)
         if (!settled) {
-          rejectCandidate(new RemoteStreamCarrierError(
-            'api gateway: Remote stream WebSocket closed before opening',
-          ))
+          if (error instanceof RemoteStreamError) {
+            this.failPendingGeneration(error)
+            this.failWaiters(error)
+          }
+          rejectCandidate(error)
           return
         }
-        this.lost(socket)
+        this.lost(socket, error)
       }
-      const received = (event: MessageEvent): void => { this.receive(socket, event.data) }
+      const received = (event: MessageEvent): void => {
+        if (settled) {
+          this.receive(socket, event.data)
+          return
+        }
+        try {
+          const message = decodeRemoteStreamServerMessage(event.data)
+          if (message.type !== 'hello') {
+            throw new Error('api gateway: Remote stream Host hello must be the first frame')
+          }
+          accepted(message)
+        } catch (cause) {
+          this.failPendingGeneration(remoteStreamBindingError())
+          rejectCandidate(
+            new RemoteStreamCarrierError('api gateway: invalid Remote stream Host hello', { cause }),
+            4002,
+            'invalid Remote stream Host hello',
+          )
+        }
+      }
       this.cancelCandidate = rejectCandidate
       socket.addEventListener('open', opened, { once: true })
       socket.addEventListener('error', failed, { once: true })
@@ -196,12 +251,15 @@ export class RemoteStreamMuxClient {
     if (this.disposed) return Promise.reject(new Error('api gateway: Remote stream client disposed'))
     this.start()
     return new Promise((resolve, reject) => {
+      const expectedBinding = this.binding
       const aborted = (): void => { waiter.reject(signal.reason) }
       const cleanup = (): void => {
+        clearTimeout(timeout)
         this.waiters.delete(waiter)
         signal.removeEventListener('abort', aborted)
       }
       const waiter: SocketWaiter = {
+        ...(expectedBinding === undefined ? {} : { expectedBinding }),
         resolve: (socket) => {
           cleanup()
           resolve(socket)
@@ -213,6 +271,12 @@ export class RemoteStreamMuxClient {
           reject(error)
         },
       }
+      const timeout = setTimeout(
+        () => { waiter.reject(socketWaitTimeoutError(expectedBinding)) },
+        expectedBinding?.mode === 'authenticated'
+          ? AUTHENTICATED_RESUME_WINDOW_MS
+          : HOST_HELLO_WINDOW_MS,
+      )
       this.waiters.add(waiter)
       signal.addEventListener('abort', aborted, { once: true })
     })
@@ -221,12 +285,11 @@ export class RemoteStreamMuxClient {
   private receive(socket: WebSocket, data: unknown): void {
     if (socket !== this.socket) return
     try {
-      if (typeof data !== 'string') throw new Error('api gateway: Remote stream WebSocket requires text messages')
-      const frame = parseRemoteStreamServerMessage(data)
+      const frame = decodeRemoteStreamServerMessage(data)
+      if (frame.type === 'hello') throw new Error('api gateway: duplicate Remote stream Host hello')
       this.streams.get(frame.streamId)?.push(frame)
     } catch (error) {
       const failure = new RemoteStreamCarrierError('api gateway: invalid Remote stream frame', { cause: error })
-      this.failAll(failure)
       this.lost(socket, failure)
       socket.close(4002, 'invalid Remote stream frame')
     }
@@ -234,13 +297,12 @@ export class RemoteStreamMuxClient {
 
   private lost(
     socket: WebSocket,
-    error: RemoteStreamCarrierError = new RemoteStreamCarrierError(
-      'api gateway: Remote stream WebSocket closed',
-    ),
+    error: Error,
   ): void {
     if (this.socket !== socket) return
     this.socket = undefined
-    this.failAll(error)
+    if (error instanceof RemoteStreamCarrierError) this.deferGenerationFailure(error)
+    else this.failPendingGeneration(error)
     this.maintain(error)
   }
 
@@ -288,9 +350,75 @@ export class RemoteStreamMuxClient {
     for (const stream of this.streams.values()) stream.fail(error)
   }
 
+  private failWaiters(error: unknown): void {
+    for (const waiter of [...this.waiters]) waiter.reject(error)
+  }
+
+  private failAuthenticatedWaiters(error: unknown): void {
+    for (const waiter of [...this.waiters]) {
+      if (waiter.expectedBinding !== undefined) waiter.reject(error)
+    }
+  }
+
+  private acceptBinding(binding: RemoteStreamHelloMessage): void {
+    const previous = this.binding
+    const failure = this.pendingGenerationFailure
+    this.binding = binding
+    this.clearAuthenticatedResumeTimer()
+    this.pendingGenerationFailure = undefined
+    if (failure === undefined) return
+    this.failAll(previous !== undefined && canResumeRemoteStreams(previous, binding)
+      ? failure
+      : remoteStreamBindingError())
+  }
+
+  private failPendingGeneration(error: Error): void {
+    this.clearAuthenticatedResumeTimer()
+    this.pendingGenerationFailure = undefined
+    this.failAll(error)
+  }
+
+  private deferGenerationFailure(error: RemoteStreamCarrierError): void {
+    this.pendingGenerationFailure = error
+    this.clearAuthenticatedResumeTimer()
+    if (this.binding?.mode !== 'authenticated') {
+      this.failPendingGeneration(error)
+      return
+    }
+    if (this.binding.binding === null) {
+      this.failPendingGeneration(remoteStreamBindingError())
+      return
+    }
+    this.authenticatedResumeTimer = setTimeout(() => {
+      this.authenticatedResumeTimer = undefined
+      if (this.pendingGenerationFailure !== undefined) {
+        const policy = remoteStreamResumeTimeoutError()
+        this.failPendingGeneration(policy)
+        this.failAuthenticatedWaiters(policy)
+        this.cancelCandidate?.(policy, 4003, 'authenticated Remote stream resume timed out')
+      }
+    }, AUTHENTICATED_RESUME_WINDOW_MS)
+  }
+
+  private clearAuthenticatedResumeTimer(): void {
+    clearTimeout(this.authenticatedResumeTimer)
+    this.authenticatedResumeTimer = undefined
+  }
+
   private send(socket: WebSocket, message: RemoteStreamClientMessage): void {
     socket.send(JSON.stringify(message))
   }
+}
+
+function remoteStreamCloseError(event: CloseEvent): Error {
+  if (event.code === 1008) {
+    return new RemoteStreamError(
+      'remote-stream-policy',
+      'api gateway: Remote stream policy rejected the connection',
+      {},
+    )
+  }
+  return new RemoteStreamCarrierError('api gateway: Remote stream WebSocket closed')
 }
 
 function backoffDelay(attempt: number): number {
@@ -311,11 +439,11 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 class StreamInbox {
-  private readonly frames: RemoteStreamServerMessage[] = []
+  private readonly frames: RemoteStreamLogicalMessage[] = []
   private wake: (() => void) | undefined
   private failure: Error | undefined
 
-  push(frame: RemoteStreamServerMessage): void {
+  push(frame: RemoteStreamLogicalMessage): void {
     if (this.failure !== undefined) return
     this.frames.push(frame)
     this.wake?.()
@@ -330,13 +458,53 @@ class StreamInbox {
     this.wake = undefined
   }
 
-  async next(): Promise<RemoteStreamServerMessage> {
+  async next(): Promise<RemoteStreamLogicalMessage> {
     while (this.frames.length === 0) {
       if (this.failure !== undefined) throw this.failure
       await new Promise<void>((resolve) => { this.wake = resolve })
     }
-    return this.frames.shift() as RemoteStreamServerMessage
+    return this.frames.shift() as RemoteStreamLogicalMessage
   }
+}
+
+function decodeRemoteStreamServerMessage(data: unknown): RemoteStreamServerMessage {
+  if (typeof data !== 'string') throw new Error('api gateway: Remote stream WebSocket requires text messages')
+  return parseRemoteStreamServerMessage(data)
+}
+
+function canResumeRemoteStreams(
+  previous: RemoteStreamHelloMessage,
+  current: RemoteStreamHelloMessage,
+): boolean {
+  if (previous.mode === 'legacy') return current.mode === 'legacy'
+  return current.mode === 'authenticated'
+    && previous.binding !== null
+    && previous.binding === current.binding
+}
+
+function remoteStreamBindingError(): RemoteStreamError {
+  return new RemoteStreamError(
+    'remote-stream-policy',
+    'api gateway: Remote stream authentication changed while reconnecting',
+    {},
+  )
+}
+
+function remoteStreamResumeTimeoutError(): RemoteStreamError {
+  return new RemoteStreamError(
+    'remote-stream-policy',
+    'api gateway: Remote stream authentication could not be confirmed while reconnecting',
+    { reason: 'authenticated-resume-window-expired' },
+  )
+}
+
+function socketWaitTimeoutError(binding: RemoteStreamHelloMessage | undefined): Error {
+  if (binding?.mode === 'authenticated') return remoteStreamResumeTimeoutError()
+  return new RemoteStreamCarrierError(
+    binding === undefined
+      ? 'api gateway: Remote stream connection could not be established within the Host hello window'
+      : 'api gateway: legacy Remote stream connection could not be restored within the Host hello window',
+  )
 }
 
 function remoteStreamUrl(): string {

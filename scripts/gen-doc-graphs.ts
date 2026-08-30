@@ -99,6 +99,23 @@ const GROUP_ORDER = [
 
 const SERVICE_ROLES: ServiceRole[] = [
   {
+    key: 'principalProvider',
+    pkg: 'principal',
+    title: 'Authenticated Principal provider',
+    mode: 'seam',
+    implementations: ['principal-oidc'],
+    consumers: ['client-connection'],
+    note: 'Connection authenticates each required-mode carrier through the deployment provider; protocol credentials and original claims remain inside the implementation.',
+  },
+  {
+    key: 'principals',
+    pkg: 'principal',
+    title: 'Host Principal request context',
+    mode: 'core',
+    consumers: ['client-connection'],
+    note: 'Scopes one verified immutable Principal to a Host request chain and rejects absent, expired, or invalidated contexts at the consuming operation.',
+  },
+  {
     key: 'attachments',
     pkg: 'attachment',
     title: 'Durable binary attachment storage',

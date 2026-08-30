@@ -249,6 +249,18 @@ export type RemoteStreamClientMessage =
   }
   | { readonly type: 'cancel'; readonly streamId: string }
 
+/** Host-derived opaque identity for one authenticated WebSocket generation. */
+export type RemoteStreamConnectionBinding = Branded<'RemoteStreamConnectionBinding'>
+
+/** First Host frame classifying whether a later generation can resume prior streams. */
+export type RemoteStreamHelloMessage =
+  | { readonly type: 'hello'; readonly mode: 'legacy'; readonly binding: null }
+  | {
+    readonly type: 'hello'
+    readonly mode: 'authenticated'
+    readonly binding: RemoteStreamConnectionBinding | null
+  }
+
 /** Carrier-safe failure delivered by the Host. */
 export interface RemoteStreamFailure {
   readonly code: string
@@ -258,6 +270,7 @@ export interface RemoteStreamFailure {
 
 /** One logical stream frame sent from the Host. */
 export type RemoteStreamServerMessage =
+  | RemoteStreamHelloMessage
   | { readonly type: 'item'; readonly streamId: string; readonly value?: unknown }
   | { readonly type: 'error'; readonly streamId: string; readonly error: RemoteStreamFailure }
   | { readonly type: 'end'; readonly streamId: string }
@@ -290,6 +303,12 @@ export function parseRemoteStreamClientMessage(text: string): RemoteStreamClient
  */
 export function parseRemoteStreamServerMessage(text: string): RemoteStreamServerMessage {
   return parseMessage(text, (value) => {
+    if (value.type === 'hello'
+      && exactKeys(value, ['type', 'mode', 'binding'])
+      && ((value.mode === 'legacy' && value.binding === null)
+        || (value.mode === 'authenticated' && (value.binding === null || validId(value.binding))))) {
+      return value as unknown as RemoteStreamServerMessage
+    }
     if (value.type === 'item'
       && (exactKeys(value, ['type', 'streamId']) || exactKeys(value, ['type', 'streamId', 'value']))
       && validId(value.streamId)) {

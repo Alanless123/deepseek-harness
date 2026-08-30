@@ -28,7 +28,7 @@ This package implements `PrincipalProvider` with OpenID Connect Authorization Co
 | Key | Meaning |
 |---|---|
 | `issuer`, `clientId`, `accessTokenAudience`, `redirectUri` | Exact OIDC authority, registered client, required access-token resource audience, and callback URI |
-| `clientSecret` | Optional confidential-client secret; omit for a public PKCE client |
+| `clientSecret` | Required confidential-client secret; missing or empty configuration fails provider activation |
 | `postLogoutRedirectUri` | Same-origin destination after RP-initiated logout |
 | `scopes`, `signingAlgorithm` | Requested scopes including `openid`, and the allowed asymmetric JWS algorithm |
 | `revalidateIntervalSeconds`, `sessionMaxAgeSeconds` | Introspection cache interval (capped at 60 seconds for active contexts) and absolute Host session lifetime |

@@ -25,6 +25,7 @@ export interface AuthenticatedPrincipalContext {
   readonly invalidated: AbortSignal
   /** Provider-owned maximum delay between active-stream revalidation attempts. */
   readonly revalidateIntervalMs: number
+  /** Optional opaque identifier that is unique to this Provider session and never caller supplied. */
   readonly sessionId?: string
 }
 

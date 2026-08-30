@@ -127,6 +127,7 @@ export interface ConnectionRequestContext {
   readonly expiresAt?: number | undefined
   readonly invalidated?: AbortSignal | undefined
   readonly revalidateIntervalMs?: number | undefined
+  /** Provider-created opaque session identity used only for Host transport binding. */
   readonly sessionId?: string | undefined
 }
 

@@ -25,6 +25,7 @@ import {
   RemoteStreamError,
   RemoteStreamMuxClient,
 } from '../src/client/stream-client.ts'
+import type { RemoteStreamHelloMessage } from '../src/stream-protocol.ts'
 
 type FixtureApprovalOutcome = 'allowed' | 'unavailable'
 const fixtureContextTag = Symbol('fixture-context-tag')
@@ -222,6 +223,7 @@ function streamDescriptor(): InvocationDescriptor {
 }
 
 type WebSocketGlobal = { WebSocket?: typeof WebSocket }
+const LEGACY_STREAM_HELLO = { type: 'hello', mode: 'legacy', binding: null } as const
 
 class FakeWebSocket extends EventTarget {
   static readonly CONNECTING = 0
@@ -246,10 +248,11 @@ class FakeWebSocket extends EventTarget {
     })
   }
 
-  open(): void {
+  open(hello: RemoteStreamHelloMessage | false = LEGACY_STREAM_HELLO): void {
     if (this.readyState !== FakeWebSocket.CONNECTING) return
     this.readyState = FakeWebSocket.OPEN
     this.dispatchEvent(new Event('open'))
+    if (hello !== false) this.receive(hello)
   }
 
   fail(): void {
@@ -274,10 +277,15 @@ class FakeWebSocket extends EventTarget {
     this.drop()
   }
 
-  drop(): void {
+  drop(code = 1006, reason = ''): void {
     if (this.readyState === FakeWebSocket.CLOSED) return
     this.readyState = FakeWebSocket.CLOSED
-    this.dispatchEvent(new Event('close'))
+    const event = new Event('close') as CloseEvent
+    Object.defineProperties(event, {
+      code: { value: code },
+      reason: { value: reason },
+    })
+    this.dispatchEvent(event)
   }
 
   receive(value: unknown): void {
@@ -289,6 +297,24 @@ class FakeWebSocket extends EventTarget {
       data,
     }))
   }
+}
+
+function authenticatedStreamHello(binding: string | null): RemoteStreamHelloMessage {
+  return { type: 'hello', mode: 'authenticated', binding } as RemoteStreamHelloMessage
+}
+
+function fixtureReconnectStream(mux: RemoteStreamMuxClient): RemoteStream<string> {
+  const connection = {
+    generation: {
+      getSnapshot: () => ({ id: 1, host: { home: '/home/fixture' } }),
+      subscribe: () => () => {},
+    },
+  }
+  return new RemoteStream<string>(connection, {
+    name: 'Principal-bound fixture stream',
+    open: signal => mux.open('feed/follow', {}, signal) as AsyncIterable<string>,
+    ended: () => new Error('fixture stream ended'),
+  })
 }
 
 async function bench(
@@ -2308,6 +2334,465 @@ describe('Remote stream client carrier lifecycle', () => {
       })
       expect(socket.closedWith).toContainEqual({ code: 4002, reason: 'invalid Remote stream frame' })
       await client.close()
+    })
+  })
+
+  it('retries an accepted logical stream after a masked close only when the Host binding is unchanged', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const stream = fixtureReconnectStream(mux)
+        const iterator = stream[Symbol.asyncIterator]()
+        const firstPending = iterator.next()
+        const firstSocket = FakeWebSocket.sockets[0]!
+        firstSocket.open(authenticatedStreamHello('same-session-binding'))
+        await vi.waitFor(() => { expect(firstSocket.sent).toHaveLength(1) })
+        const firstOpen = JSON.parse(firstSocket.sent[0]!) as { streamId: string }
+        firstSocket.receive({ type: 'item', streamId: firstOpen.streamId, value: 'before-reconnect' })
+        const first = await firstPending
+        expect(first).toMatchObject({ done: false, value: { generation: 1, value: 'before-reconnect' } })
+        if (first.done) throw new Error('fixture stream ended before the first item')
+        first.value.accept()
+
+        const resumedPending = iterator.next()
+        firstSocket.drop(1006)
+        await vi.advanceTimersByTimeAsync(500)
+        const replacement = FakeWebSocket.sockets[1]!
+        replacement.open(authenticatedStreamHello('same-session-binding'))
+        await vi.waitFor(() => { expect(replacement.sent).toHaveLength(1) })
+        await vi.advanceTimersByTimeAsync(30_000)
+        const replacementOpen = JSON.parse(replacement.sent[0]!) as { streamId: string }
+        replacement.receive({ type: 'item', streamId: replacementOpen.streamId, value: 'after-reconnect' })
+
+        const resumed = await resumedPending
+        expect(resumed).toMatchObject({ done: false, value: { generation: 2, value: 'after-reconnect' } })
+        await stream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('terminates an old logical stream after a masked close when the Host binding changes', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const oldStream = fixtureReconnectStream(mux)
+        const oldIterator = oldStream[Symbol.asyncIterator]()
+        const firstPending = oldIterator.next()
+        const aliceSocket = FakeWebSocket.sockets[0]!
+        aliceSocket.open(authenticatedStreamHello('alice-session-binding'))
+        await vi.waitFor(() => { expect(aliceSocket.sent).toHaveLength(1) })
+        const aliceOpen = JSON.parse(aliceSocket.sent[0]!) as { streamId: string }
+        aliceSocket.receive({ type: 'item', streamId: aliceOpen.streamId, value: 'alice' })
+        const alice = await firstPending
+        if (alice.done) throw new Error('fixture stream ended before Alice item')
+        alice.value.accept()
+
+        const oldPending = oldIterator.next()
+        aliceSocket.drop(1006)
+        await vi.advanceTimersByTimeAsync(500)
+        const bobSocket = FakeWebSocket.sockets[1]!
+        bobSocket.open(authenticatedStreamHello('bob-session-binding'))
+        await expect(oldPending).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+        })
+        expect(bobSocket.sent).toEqual([])
+
+        const newStream = fixtureReconnectStream(mux)
+        const bobPending = newStream[Symbol.asyncIterator]().next()
+        await vi.waitFor(() => { expect(bobSocket.sent).toHaveLength(1) })
+        const bobOpen = JSON.parse(bobSocket.sent[0]!) as { streamId: string }
+        bobSocket.receive({ type: 'item', streamId: bobOpen.streamId, value: 'bob' })
+        await expect(bobPending).resolves.toMatchObject({
+          done: false,
+          value: { generation: 1, value: 'bob' },
+        })
+
+        await oldStream.dispose()
+        await newStream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('bounds an authenticated logical stream while reconnect attempts fail before Host hello', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const oldStream = fixtureReconnectStream(mux)
+        const oldIterator = oldStream[Symbol.asyncIterator]()
+        const firstPending = oldIterator.next()
+        const authenticated = FakeWebSocket.sockets[0]!
+        authenticated.open(authenticatedStreamHello('expiring-session-binding'))
+        await vi.waitFor(() => { expect(authenticated.sent).toHaveLength(1) })
+        const firstOpen = JSON.parse(authenticated.sent[0]!) as { streamId: string }
+        authenticated.receive({ type: 'item', streamId: firstOpen.streamId, value: 'authenticated' })
+        const first = await firstPending
+        if (first.done) throw new Error('fixture stream ended before the authenticated item')
+        first.value.accept()
+
+        const afterRevocation = oldIterator.next()
+        const terminal = expect(afterRevocation).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+          details: { reason: 'authenticated-resume-window-expired' },
+        })
+        authenticated.drop(1006)
+        await vi.advanceTimersByTimeAsync(500)
+        const rejectedUpgrade = FakeWebSocket.sockets[1]!
+        rejectedUpgrade.fail()
+        await vi.advanceTimersByTimeAsync(1_000)
+        const rejectedPreHello = FakeWebSocket.sockets[2]!
+        rejectedPreHello.open(false)
+        rejectedPreHello.drop(1006)
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        await terminal
+        expect(FakeWebSocket.sockets.some(socket => socket.closedWith.some(close => close.code === 4003))).toBe(true)
+        await oldStream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('bounds the first logical waiter when no physical candidate provides a Host hello', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const pending = mux.open('feed/follow', {}, new AbortController().signal)
+          [Symbol.asyncIterator]().next()
+        const terminal = expect(pending).rejects.toMatchObject({
+          name: 'RemoteStreamCarrierError',
+          message: 'api gateway: Remote stream connection could not be established within the Host hello window',
+        })
+        FakeWebSocket.sockets[0]!.open(false)
+
+        await vi.advanceTimersByTimeAsync(30_000)
+        await terminal
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('bounds a new authenticated waiter created after the generation recovery window expired', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        mux.start()
+        const authenticated = FakeWebSocket.sockets[0]!
+        authenticated.open(authenticatedStreamHello('expired-session-binding'))
+        await vi.advanceTimersByTimeAsync(0)
+        authenticated.drop(1006)
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        const pending = mux.open('feed/follow', {}, new AbortController().signal)
+          [Symbol.asyncIterator]().next()
+        const terminal = expect(pending).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+          details: { reason: 'authenticated-resume-window-expired' },
+        })
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        await terminal
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('rejects an authenticated waiter when the replacement Host binding changes', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        mux.start()
+        const alice = FakeWebSocket.sockets[0]!
+        alice.open(authenticatedStreamHello('alice-session-binding'))
+        await vi.advanceTimersByTimeAsync(0)
+        alice.drop(1006)
+
+        const queued = mux.open(
+          'feed/follow',
+          { requestedBeforeReplacementHello: true },
+          new AbortController().signal,
+        )[Symbol.asyncIterator]().next()
+        const terminal = expect(queued).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+        })
+        await vi.advanceTimersByTimeAsync(500)
+        const bob = FakeWebSocket.sockets[1]!
+        bob.open(authenticatedStreamHello('bob-session-binding'))
+
+        await terminal
+        expect(bob.sent).toEqual([])
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('times out a physical connection that opens without a Host hello', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        mux.start()
+        const candidate = FakeWebSocket.sockets[0]!
+        candidate.open(false)
+
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(candidate.closedWith).toContainEqual({
+          code: 4002,
+          reason: 'Remote stream Host hello timed out',
+        })
+        await vi.advanceTimersByTimeAsync(500)
+        expect(FakeWebSocket.sockets).toHaveLength(2)
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('fails a legacy logical mux stream immediately when its carrier closes', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      const mux = new RemoteStreamMuxClient()
+      const iterator = mux.open('feed/follow', {}, new AbortController().signal)[Symbol.asyncIterator]()
+      const firstPending = iterator.next()
+      const original = FakeWebSocket.sockets[0]!
+      original.open()
+      await vi.waitFor(() => { expect(original.sent).toHaveLength(1) })
+      const firstOpen = JSON.parse(original.sent[0]!) as { streamId: string }
+      original.receive({ type: 'item', streamId: firstOpen.streamId, value: 'legacy' })
+      await expect(firstPending).resolves.toEqual({ done: false, value: 'legacy' })
+
+      const afterClose = iterator.next()
+      original.drop(1006)
+      await expect(afterClose).rejects.toMatchObject({
+        name: 'RemoteStreamCarrierError',
+        message: 'api gateway: Remote stream WebSocket closed',
+      })
+      await mux.close()
+    })
+  })
+
+  it('restores a legacy logical stream inside the bounded Host hello window', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const stream = fixtureReconnectStream(mux)
+        const iterator = stream[Symbol.asyncIterator]()
+        const firstPending = iterator.next()
+        const original = FakeWebSocket.sockets[0]!
+        original.open()
+        await vi.waitFor(() => { expect(original.sent).toHaveLength(1) })
+        const firstOpen = JSON.parse(original.sent[0]!) as { streamId: string }
+        original.receive({ type: 'item', streamId: firstOpen.streamId, value: 'legacy' })
+        const first = await firstPending
+        if (first.done) throw new Error('fixture stream ended before the legacy item')
+        first.value.accept()
+
+        const resumedPending = iterator.next()
+        original.drop(1006)
+        await vi.advanceTimersByTimeAsync(500)
+        const replacement = FakeWebSocket.sockets[1]!
+        replacement.open()
+        await vi.waitFor(() => { expect(replacement.sent).toHaveLength(1) })
+        const replacementOpen = JSON.parse(replacement.sent[0]!) as { streamId: string }
+        replacement.receive({ type: 'item', streamId: replacementOpen.streamId, value: 'legacy-resumed' })
+        await expect(resumedPending).resolves.toMatchObject({
+          done: false,
+          value: { generation: 2, value: 'legacy-resumed' },
+        })
+
+        await stream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('bounds a legacy supervisor retry when no replacement provides a Host hello', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const stream = fixtureReconnectStream(mux)
+        const iterator = stream[Symbol.asyncIterator]()
+        const firstPending = iterator.next()
+        const legacy = FakeWebSocket.sockets[0]!
+        legacy.open()
+        await vi.waitFor(() => { expect(legacy.sent).toHaveLength(1) })
+        const legacyOpen = JSON.parse(legacy.sent[0]!) as { streamId: string }
+        legacy.receive({ type: 'item', streamId: legacyOpen.streamId, value: 'legacy' })
+        const first = await firstPending
+        if (first.done) throw new Error('fixture stream ended before the legacy item')
+        first.value.accept()
+
+        const retry = iterator.next()
+        const terminal = expect(retry).rejects.toMatchObject({
+          name: 'RemoteStreamCarrierError',
+          message: 'api gateway: legacy Remote stream connection could not be restored within the Host hello window',
+        })
+        legacy.drop(1006)
+        await vi.advanceTimersByTimeAsync(31_000)
+
+        await terminal
+        await stream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('does not replay a legacy logical stream into an authenticated replacement generation', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const stream = fixtureReconnectStream(mux)
+        const iterator = stream[Symbol.asyncIterator]()
+        const firstPending = iterator.next()
+        const legacy = FakeWebSocket.sockets[0]!
+        legacy.open()
+        await vi.waitFor(() => { expect(legacy.sent).toHaveLength(1) })
+        const legacyOpen = JSON.parse(legacy.sent[0]!) as { streamId: string }
+        legacy.receive({ type: 'item', streamId: legacyOpen.streamId, value: 'legacy' })
+        const first = await firstPending
+        if (first.done) throw new Error('fixture stream ended before the legacy item')
+        first.value.accept()
+
+        const replay = iterator.next()
+        legacy.drop(1006)
+        await vi.advanceTimersByTimeAsync(500)
+        const authenticated = FakeWebSocket.sockets[1]!
+        authenticated.open(authenticatedStreamHello('new-authenticated-session'))
+
+        await expect(replay).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+        })
+        expect(authenticated.sent).toEqual([])
+        await stream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it('ends the old logical stream on policy close before reconnecting for an explicit new stream', async () => {
+    await withFakeWebSocket('https://harness.example', async () => {
+      FakeWebSocket.autoOpen = false
+      vi.useFakeTimers()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mux = new RemoteStreamMuxClient()
+        const connection = {
+          generation: {
+            getSnapshot: () => ({ id: 1, host: { home: '/home/fixture' } }),
+            subscribe: () => () => {},
+          },
+        }
+        const createStream = (): RemoteStream<string> => new RemoteStream<string>(connection, {
+          name: 'Principal-bound fixture stream',
+          open: signal => mux.open('feed/follow', {}, signal) as AsyncIterable<string>,
+          ended: () => new Error('fixture stream ended'),
+        })
+        const oldStream = createStream()
+        const oldIterator = oldStream[Symbol.asyncIterator]()
+        const first = oldIterator.next()
+        const aliceSocket = FakeWebSocket.sockets[0]!
+        aliceSocket.open(authenticatedStreamHello('alice-session-binding'))
+        await vi.waitFor(() => { expect(aliceSocket.sent).toHaveLength(1) })
+        const aliceOpen = JSON.parse(aliceSocket.sent[0]!) as { streamId: string }
+        aliceSocket.receive({ type: 'item', streamId: aliceOpen.streamId, value: 'alice' })
+        const alice = await first
+        expect(alice).toMatchObject({ done: false, value: { generation: 1, value: 'alice' } })
+        if (alice.done) throw new Error('fixture stream ended before Alice item')
+        alice.value.accept()
+
+        const afterPolicyClose = oldIterator.next()
+        aliceSocket.drop(1008, 'authenticated Principal is no longer active')
+        await expect(afterPolicyClose).rejects.toMatchObject({
+          name: 'RemoteStreamError',
+          code: 'remote-stream-policy',
+        })
+
+        await vi.advanceTimersByTimeAsync(500)
+        expect(FakeWebSocket.sockets).toHaveLength(2)
+        const bobSocket = FakeWebSocket.sockets[1]!
+        bobSocket.open(authenticatedStreamHello('bob-session-binding'))
+        await vi.advanceTimersByTimeAsync(0)
+        const newStream = createStream()
+        const bobItem = newStream[Symbol.asyncIterator]().next()
+        await vi.waitFor(() => { expect(bobSocket.sent).toHaveLength(1) })
+        const bobOpen = JSON.parse(bobSocket.sent[0]!) as { streamId: string }
+        bobSocket.receive({ type: 'item', streamId: bobOpen.streamId, value: 'bob' })
+        await expect(bobItem).resolves.toMatchObject({
+          done: false,
+          value: { generation: 1, value: 'bob' },
+        })
+
+        await oldStream.dispose()
+        await newStream.dispose()
+        await mux.close()
+      } finally {
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
     })
   })
 

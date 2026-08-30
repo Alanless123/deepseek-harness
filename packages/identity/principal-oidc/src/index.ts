@@ -18,7 +18,6 @@ import { createRemoteJWKSet, errors as joseErrors, jwtVerify, type JWTPayload } 
 import {
   ClientError,
   ClientSecretPost,
-  None,
   ResponseBodyError,
   allowInsecureRequests,
   authorizationCodeGrant,
@@ -69,8 +68,8 @@ export interface Config {
   clientId: string
   /** Exact resource-server audience required on every active access token. */
   accessTokenAudience: string
-  /** Confidential-client secret. Omit for a public PKCE client. */
-  clientSecret?: string
+  /** Confidential-client secret. */
+  clientSecret: string
   /** Exact registered Authorization Code callback URI. */
   redirectUri: string
   /** Exact registered post-logout URI; defaults to the redirect URI origin. */
@@ -101,7 +100,7 @@ export const Config: z<Config> = z.object({
   issuer: z.string().required(),
   clientId: z.string().required(),
   accessTokenAudience: z.string().required(),
-  clientSecret: z.string().role('secret'),
+  clientSecret: z.string().required().role('secret'),
   redirectUri: z.string().required(),
   postLogoutRedirectUri: z.string(),
   scopes: z.array(z.string()).default(['openid', 'profile', 'email']),
@@ -121,7 +120,7 @@ interface ResolvedConfig {
   readonly issuerUrl: URL
   readonly clientId: string
   readonly accessTokenAudience: string
-  readonly clientSecret?: string
+  readonly clientSecret: string
   readonly redirectUri: URL
   readonly postLogoutRedirectUri: URL
   readonly scopes: readonly string[]
@@ -208,9 +207,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
    */
   static async create(ctx: Context, input: Config): Promise<OidcPrincipalProvider> {
     const options = resolveConfig(input)
-    const clientAuthentication = options.clientSecret === undefined
-      ? None()
-      : ClientSecretPost(options.clientSecret)
+    const clientAuthentication = ClientSecretPost(options.clientSecret)
     const execute: ((configuration: Configuration) => void)[] = [enableNonRepudiationChecks]
     if (options.allowInsecureHttp) {
       // oxlint-disable-next-line typescript/no-deprecated -- Explicitly gated to loopback development URLs above.
@@ -222,7 +219,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
       {
         redirect_uris: [options.redirectUri.href],
         response_types: ['code'],
-        token_endpoint_auth_method: options.clientSecret === undefined ? 'none' : 'client_secret_post',
+        token_endpoint_auth_method: 'client_secret_post',
         id_token_signed_response_alg: options.signingAlgorithm,
       },
       clientAuthentication,
@@ -776,7 +773,7 @@ function resolveConfig(input: Config): ResolvedConfig {
   }
   requireNonEmpty(input.clientId, 'clientId')
   requireNonEmpty(input.accessTokenAudience, 'accessTokenAudience')
-  if (input.clientSecret !== undefined) requireNonEmpty(input.clientSecret, 'clientSecret')
+  requireNonEmpty(input.clientSecret, 'clientSecret')
   const scopes = input.scopes ?? ['openid', 'profile', 'email']
   if (scopes.length === 0 || !scopes.includes('openid')) throw new TypeError('OIDC scopes must include openid')
   const uniqueScopes = [...new Set(scopes.map((scope) => {
@@ -802,7 +799,7 @@ function resolveConfig(input: Config): ResolvedConfig {
     issuerUrl,
     clientId: input.clientId,
     accessTokenAudience: input.accessTokenAudience,
-    ...(input.clientSecret === undefined ? {} : { clientSecret: input.clientSecret }),
+    clientSecret: input.clientSecret,
     redirectUri,
     postLogoutRedirectUri,
     scopes: uniqueScopes,

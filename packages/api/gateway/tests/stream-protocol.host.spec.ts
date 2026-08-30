@@ -29,6 +29,15 @@ describe('Remote stream wire protocol', () => {
 
   it('accepts every server message variant', () => {
     expect(parseRemoteStreamServerMessage(JSON.stringify({
+      type: 'hello', mode: 'legacy', binding: null,
+    }))).toEqual({ type: 'hello', mode: 'legacy', binding: null })
+    expect(parseRemoteStreamServerMessage(JSON.stringify({
+      type: 'hello', mode: 'authenticated', binding: 'opaque-binding',
+    }))).toEqual({ type: 'hello', mode: 'authenticated', binding: 'opaque-binding' })
+    expect(parseRemoteStreamServerMessage(JSON.stringify({
+      type: 'hello', mode: 'authenticated', binding: null,
+    }))).toEqual({ type: 'hello', mode: 'authenticated', binding: null })
+    expect(parseRemoteStreamServerMessage(JSON.stringify({
       type: 'item', streamId: 'stream-1', value: null,
     }))).toEqual({ type: 'item', streamId: 'stream-1', value: null })
     expect(parseRemoteStreamServerMessage(JSON.stringify({
@@ -49,6 +58,10 @@ describe('Remote stream wire protocol', () => {
   })
 
   it.each([
+    { type: 'hello', mode: 'legacy', binding: 'browser-value' },
+    { type: 'hello', mode: 'authenticated', binding: '' },
+    { type: 'hello', mode: 'authenticated' },
+    { type: 'hello', mode: 'unknown', binding: null },
     { type: 'item', streamId: '', value: 'item' },
     { type: 'item', streamId: 'stream-1', extra: true },
     { type: 'end', streamId: 'stream-1', extra: true },

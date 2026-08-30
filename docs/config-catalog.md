@@ -1637,8 +1637,8 @@ export interface Config {
   clientId: string
   /** Exact resource-server audience required on every active access token. */
   accessTokenAudience: string
-  /** Confidential-client secret. Omit for a public PKCE client. */
-  clientSecret?: string
+  /** Confidential-client secret. */
+  clientSecret: string
   /** Exact registered Authorization Code callback URI. */
   redirectUri: string
   /** Exact registered post-logout URI; defaults to the redirect URI origin. */
@@ -1666,7 +1666,7 @@ export interface Config {
 }
 ```
 
-Source: [`packages/identity/principal-oidc/src/index.ts:58`](../packages/identity/principal-oidc/src/index.ts)
+Source: [`packages/identity/principal-oidc/src/index.ts:64`](../packages/identity/principal-oidc/src/index.ts)
 
 <a id="deepseek-aidsh-pwsh-local"></a>
 

@@ -28,7 +28,7 @@ kind: "package-reference"
 | 配置键 | 含义 |
 |---|---|
 | `issuer`, `clientId`, `accessTokenAudience`, `redirectUri` | 精确 OIDC authority、注册 client、必需的 access-token 资源 audience 与 callback URI |
-| `clientSecret` | 可选 confidential-client secret；public PKCE client 省略此项 |
+| `clientSecret` | 必填 confidential-client secret；缺失或为空时提供方启动失败 |
 | `postLogoutRedirectUri` | RP 发起注销后的同源目的地 |
 | `scopes`, `signingAlgorithm` | 包含 `openid` 的请求 scope，以及允许的非对称 JWS algorithm |
 | `revalidateIntervalSeconds`, `sessionMaxAgeSeconds` | 内省缓存间隔（活跃上下文最高 60 秒）与 Host session 绝对生命周期 |

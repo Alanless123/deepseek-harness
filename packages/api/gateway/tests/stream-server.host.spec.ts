@@ -10,6 +10,8 @@ import {
   type RemoteStreamPrincipalRevalidator,
 } from '../src/stream-server.ts'
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
 interface RunningMux {
   readonly http: Server
   readonly mux: RemoteStreamMuxServer
@@ -192,6 +194,7 @@ describe('Remote stream mux server carrier lifecycle', () => {
     const invalidation = new AbortController()
     const context: ConnectionRequestContext = {
       principal: { principalId: 'oidc:v1:alice', displayName: 'Alice' },
+      sessionId: 'host-only-session-id',
       expiresAt: Date.now() + 60_000,
       invalidated: invalidation.signal,
       revalidateIntervalMs: 15_000,
@@ -203,7 +206,16 @@ describe('Remote stream mux server carrier lifecycle', () => {
       seen = requestContext
       return cleanlyCancelled(signal, returned)
     }, 30_000, context)
-    const client = await connect(entry.url)
+    const client = new WebSocket(entry.url)
+    const firstMessage = once(client, 'message')
+    await once(client, 'open')
+    const helloData: unknown = (await firstMessage as unknown[])[0]
+    if (!Buffer.isBuffer(helloData)) throw new TypeError('fixture expected a Buffer hello frame')
+    const hello = JSON.parse(helloData.toString('utf8')) as { type: string; mode: string; binding: string }
+    expect(hello).toMatchObject({ type: 'hello', mode: 'authenticated' })
+    expect(hello.binding).toMatch(/^[A-Za-z0-9_-]{43}$/u)
+    expect(hello.binding).not.toContain(context.sessionId)
+    expect(JSON.stringify(hello)).not.toContain(context.principal?.principalId)
     client.send(openFrame('principal-bound'))
     await vi.waitFor(() => { expect(seen?.principal?.principalId).toBe('oidc:v1:alice') })
     const closed = once(client, 'close')
@@ -212,6 +224,63 @@ describe('Remote stream mux server carrier lifecycle', () => {
     expect(event[0]).toBe(1008)
     expect(String(event[1])).toBe('authenticated Principal is no longer active')
     await didReturn
+  })
+
+  it('keeps one Host binding stable per session and separates distinct sessions', async () => {
+    const invalidated = new AbortController().signal
+    const contexts: ConnectionRequestContext[] = [
+      {
+        principal: { principalId: 'oidc:v1:alice' },
+        sessionId: 'same-host-session',
+        expiresAt: Date.now() + 60_000,
+        invalidated,
+        revalidateIntervalMs: 15_000,
+      },
+      {
+        principal: { principalId: 'oidc:v1:alice' },
+        sessionId: 'same-host-session',
+        expiresAt: Date.now() + 60_000,
+        invalidated,
+        revalidateIntervalMs: 15_000,
+      },
+      {
+        principal: { principalId: 'oidc:v1:alice' },
+        sessionId: 'different-host-session',
+        expiresAt: Date.now() + 60_000,
+        invalidated,
+        revalidateIntervalMs: 15_000,
+      },
+    ]
+    const entry = await startMux(
+      async (_endpoint, _payload, signal) => waitForAbort(signal),
+      30_000,
+      () => {
+        const context = contexts.shift()
+        if (context === undefined) throw new Error('fixture exhausted Principal contexts')
+        return context
+      },
+    )
+    const clients: WebSocket[] = []
+    const bindings: string[] = []
+    for (let index = 0; index < 3; index++) {
+      const client = new WebSocket(entry.url)
+      clients.push(client)
+      const firstMessage = once(client, 'message')
+      await once(client, 'open')
+      const data: unknown = (await firstMessage as unknown[])[0]
+      if (!Buffer.isBuffer(data)) throw new TypeError('fixture expected a Buffer hello frame')
+      const hello = JSON.parse(data.toString('utf8')) as { type: string; mode: string; binding: string }
+      expect(hello).toMatchObject({ type: 'hello', mode: 'authenticated' })
+      bindings.push(hello.binding)
+    }
+
+    expect(bindings[0]).toBe(bindings[1])
+    expect(bindings[2]).not.toBe(bindings[0])
+    await Promise.all(clients.map(async (client) => {
+      const closed = once(client, 'close')
+      client.close()
+      await closed
+    }))
   })
 
   it('closes an already-invalid generation and fails closed when periodic revalidation fails', async () => {
@@ -249,6 +318,100 @@ describe('Remote stream mux server carrier lifecycle', () => {
     expect(unavailableEvent[0]).toBe(1008)
     expect(String(unavailableEvent[1])).toBe('authenticated Principal is no longer active')
     expect(revalidate).toHaveBeenCalled()
+  })
+
+  it('expires the bound Principal exactly and never delivers a delayed item', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const context: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:expiring' },
+      sessionId: 'expiring-session-id',
+      expiresAt: Date.now() + 5_000,
+      invalidated: new AbortController().signal,
+      revalidateIntervalMs: 60_000,
+    }
+    const released = Promise.withResolvers<undefined>()
+    let markOpened!: () => void
+    const opened = new Promise<void>((resolve) => { markOpened = resolve })
+    let markReturned!: () => void
+    const returned = new Promise<void>((resolve) => { markReturned = resolve })
+    try {
+      const entry = await startMux(
+        async () => delayedItem(released.promise, markOpened, markReturned),
+        30_000,
+        context,
+        async () => {},
+      )
+      const client = await connect(entry.url)
+      const frames: unknown[] = []
+      client.on('message', (data) => {
+        if (!Buffer.isBuffer(data)) throw new TypeError('fixture expected a Buffer frame')
+        frames.push(JSON.parse(data.toString('utf8')) as unknown)
+      })
+      const closed = once(client, 'close')
+      client.send(openFrame('expires-before-item'))
+      await opened
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      const event = await closed
+      expect(event[0]).toBe(1008)
+      expect(String(event[1])).toBe('authenticated Principal is no longer active')
+      released.resolve(undefined)
+      await returned
+      expect(frames.filter(frame => (frame as { type?: string }).type !== 'hello')).toEqual([])
+    } finally {
+      released.resolve(undefined)
+      vi.useRealTimers()
+    }
+  })
+
+  it('rearms Principal expiry beyond the Node timer ceiling without expiring early', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const lifetimeMs = 3_000_000_000
+    try {
+      const context: ConnectionRequestContext = {
+        principal: { principalId: 'oidc:v1:long-lived' },
+        expiresAt: Date.now() + lifetimeMs,
+        invalidated: new AbortController().signal,
+        revalidateIntervalMs: 60_000,
+      }
+      const entry = await startMux(
+        async (_endpoint, _payload, signal) => waitForAbort(signal),
+        30_000,
+        context,
+        async () => {},
+      )
+      const client = await connect(entry.url)
+      const closed = once(client, 'close')
+
+      await vi.advanceTimersByTimeAsync(MAX_TIMER_DELAY_MS)
+      expect(client.readyState).toBe(WebSocket.OPEN)
+      await vi.advanceTimersByTimeAsync(lifetimeMs - MAX_TIMER_DELAY_MS)
+
+      const event = await closed
+      expect(event[0]).toBe(1008)
+      expect(String(event[1])).toBe('authenticated Principal is no longer active')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects an expired Principal before opening a logical stream', async () => {
+    const open = vi.fn<RemoteStreamOpener>(async (_endpoint, _payload, signal) => waitForAbort(signal))
+    const context: ConnectionRequestContext = {
+      principal: { principalId: 'oidc:v1:expired' },
+      expiresAt: Date.now() - 1,
+      invalidated: new AbortController().signal,
+      revalidateIntervalMs: 60_000,
+    }
+    const entry = await startMux(open, 30_000, context, async () => {})
+    const client = new WebSocket(entry.url)
+    const closed = once(client, 'close')
+    await once(client, 'open')
+    client.send(openFrame('must-not-open'))
+
+    const event = await closed
+    expect(event[0]).toBe(1008)
+    expect(open).not.toHaveBeenCalled()
   })
 
   it('keeps periodic Principal revalidation single-flight', async () => {
@@ -300,12 +463,14 @@ const mapFailure: RemoteStreamFailureMapper = error => ({
 async function startMux(
   open: RemoteStreamOpener,
   heartbeatIntervalMs = 30_000,
-  context: ConnectionRequestContext = {},
+  context: ConnectionRequestContext | (() => ConnectionRequestContext) = {},
   revalidate?: RemoteStreamPrincipalRevalidator,
 ): Promise<RunningMux> {
   const mux = new RemoteStreamMuxServer(open, mapFailure, heartbeatIntervalMs, revalidate)
   const http = createServer()
-  http.on('upgrade', (request, socket, head) => { mux.handleUpgrade(request, socket, head, context) })
+  http.on('upgrade', (request, socket, head) => {
+    mux.handleUpgrade(request, socket, head, typeof context === 'function' ? context() : context)
+  })
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject)
     http.listen(0, '127.0.0.1', () => {

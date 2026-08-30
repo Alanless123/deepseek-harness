@@ -14,13 +14,13 @@ DSH 通过仅限 Host 的 Principal 能力暴露已认证用户身份。`dsh-pri
 
 `dsh-client-connection` 持有载体认证。其默认 `legacy` 模式保留启动令牌行为。`principalMode: required` 先运行 Host/Origin 防线，再要求两个 Principal 服务，在解码 payload 前完成认证，并围绕一元 Remote 与精确 Fetch handler 进入 Principal 上下文。身份缺失返回 401；提供方缺失或失败返回 503。Browser payload 与类似身份的 header 永远不会填充该上下文。
 
-`dsh-api-gateway` 把已认证上下文绑定到一次获准的 WebSocket generation。每个逻辑 stream 都在该上下文中打开并推进。mux 将 stream 取消与 session 失效 signal 组合，周期性请求 Connection 复核同一个 generation，并在身份过期、撤销或无法复核时关闭 socket。重连会重新执行物理请求认证。
+`dsh-api-gateway` 把已认证上下文绑定到一次获准的 WebSocket generation。每个逻辑 stream 都在该上下文中打开并推进。mux 将 stream 取消与 session 失效 signal 组合，按认证到期时刻设置精确计时器，在每次打开与投递前检查上下文，并周期性请求 Connection 复核同一个 generation。Host 首帧携带由已认证 session id 派生的进程内不透明 binding，该值绝不取自 Browser 输入；物理候选连接若在 30 秒内未投递该首帧，就会被关闭。每个等待首个可用 Host 首帧的逻辑调用都有独立的 30 秒上限，包括在旧恢复窗口结束后才创建的调用。发生含糊的载体断开后，已认证 generation 进入最长 30 秒的恢复窗口。只有替代 Host 首帧证明同一个 non-null binding 后，已接受的逻辑流才可重试；任何已获准 generation 之后排队的调用都会保留其完整预期类型与 binding。身份过期、撤销、复核失败、已认证 binding 改变或缺失、legacy/authenticated 模式改变、明确的策略关闭，或者 upgrade 与首帧前失败持续到恢复截止时刻，都会让旧逻辑流及绑定的 waiter 以 `remote-stream-policy` 终止；只有替代身份获准后才开始的调用可以使用改变后的 binding。Legacy generation 会立即向领域 supervisor 报告载体断开；受监督的重试仍必须在调用上限内收到 legacy Host 首帧，且不得重放到 authenticated generation。
 
 `dsh-principal-oidc` 是部署级 Service Provider。它使用带 S256 PKCE 的 Authorization Code、精确 issuer discovery、state 与 nonce、非对称 ID Token 校验，并依据单独配置的资源 audience 与 OAuth `client_id` 执行 access-token 内省，同时使用有界一次性 transaction 和有界进程内 session。token 与原始 claim 留在提供方 map 中；Browser 只收到不透明 host-only cookie，Host 消费方只收到已验证 Principal 投影。RP 发起注销与带签名且防重放的 back-channel logout 会让匹配的活跃上下文失效。
 
 ## 验证
 
-包测试固定精确 issuer 与 subject 身份派生、显示名独立性、并发上下文隔离、过期、失效、discovery、PKCE、state、nonce、issuer、audience、signature、token 过期、不透明 cookie、提供方失败、内省撤销、RP 注销与带签名 back-channel logout。Connection Host 测试证明同一个由 Host 创建的上下文进入一元与精确 Fetch 分发，同时忽略伪造身份字段。Gateway 载体测试证明 WebSocket generation 绑定、周期复核、活跃 stream 取消，以及不暴露 handler 错误的 401/403/503 拒绝。
+包测试固定精确 issuer 与 subject 身份派生、显示名独立性、并发上下文隔离、过期、失效、discovery、PKCE、state、nonce、issuer、audience、signature、token 过期、不透明 cookie、提供方失败、内省撤销、RP 注销与带签名 back-channel logout。Connection Host 测试证明同一个由 Host 创建的上下文进入一元与精确 Fetch 分发，同时忽略伪造身份字段。Gateway 载体测试证明 Host-only WebSocket generation binding、masked close 后在已认证有界窗口内以同 binding 恢复、拒绝跨 binding 的排队调用、首个 waiter 与旧恢复截止后新 waiter 均有界、终止无首帧的静默候选连接、跨 binding 或恢复超时以 `remote-stream-policy` 终止、legacy 载体断开立即且重试有界、拒绝 legacy 到 authenticated 的重放、延迟投递前的精确与长期到期、周期复核、活跃 stream 取消，以及不暴露 handler 错误的 401/403/503 拒绝。
 
 ## 曾考虑的替代方案
 

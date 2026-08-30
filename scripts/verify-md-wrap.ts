@@ -22,7 +22,8 @@ const PATTERNS = [
   'docs/**/*.md',
   'packages/*/*.md',
   'packages/*/*/*.md',
-  'snapshots/**/system-prompt.expected.md',
+  // Node 22 glob descends into a matching symlink when the basename follows `**`; filter this broad match below.
+  'snapshots/**/*.md',
   'packages/**/system-prompt.expected.md',
   'AGENTS.md',
   'packages/AGENTS.md',
@@ -70,7 +71,11 @@ function findViolations(absPath: string): Violation[] {
   return out
 }
 
-const files = uniqueRepoFiles(root, PATTERNS, isArchivedAgentNotePath)
+const files = uniqueRepoFiles(root, PATTERNS, (path) => {
+  if (isArchivedAgentNotePath(path)) return true
+  if (!path.startsWith('snapshots/')) return false
+  return path !== 'snapshots/AGENTS.md' && !path.endsWith('/system-prompt.expected.md')
+})
 const all = files.flatMap(file => findViolations(file.abs))
 const checked = files.length
 

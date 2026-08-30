@@ -6,7 +6,7 @@ import { PrincipalAuthenticationError } from '@deepseek-ai/dsh-principal'
 import { exportJWK, generateKeyPair, SignJWT, type CryptoKey } from 'jose'
 import { calculatePKCECodeChallenge, customFetch, type Configuration } from 'openid-client'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { OidcPrincipalProvider, type Config } from '../src/index.ts'
+import { Config as ConfigSchema, OidcPrincipalProvider, type Config } from '../src/index.ts'
 
 const APP_ORIGIN = 'http://127.0.0.1:47891'
 const APP_HOST = '127.0.0.1:47891'
@@ -88,6 +88,7 @@ class MockIssuer {
   expectedNonce = ''
   pkceVerified = false
   introspectionCount = 0
+  discoveryCount = 0
   private privateKey!: CryptoKey
   private invalidPrivateKey!: CryptoKey
   private jwk!: Record<string, unknown>
@@ -170,6 +171,7 @@ class MockIssuer {
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? '/', this.issuer)
     if (url.pathname === '/realms/test/.well-known/openid-configuration') {
+      this.discoveryCount += 1
       json(response, 200, {
         issuer: this.discoveryIssuerOverride ?? this.issuer,
         authorization_endpoint: `${this.issuer}/authorize`,
@@ -472,6 +474,17 @@ describe('OIDC Principal provider', () => {
     issuer.discoveryIssuerOverride = `${issuer.issuer}/other`
     await expect(createProvider()).rejects.toThrow()
     issuer.discoveryIssuerOverride = undefined
+  })
+
+  it('fails before discovery when the confidential client secret is missing', async () => {
+    const missingSecret = providerConfig() as Partial<Config>
+    delete missingSecret.clientSecret
+    const discoveryCount = issuer.discoveryCount
+
+    expect(() => ConfigSchema(missingSecret as Config)).toThrow('clientSecret')
+    await expect(OidcPrincipalProvider.create(new Context(), missingSecret as Config))
+      .rejects.toThrow('clientSecret')
+    expect(issuer.discoveryCount).toBe(discoveryCount)
   })
 
   it('limits the explicit insecure-HTTP escape hatch to loopback development URLs', async () => {
