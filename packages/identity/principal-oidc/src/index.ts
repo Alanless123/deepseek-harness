@@ -210,6 +210,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     const clientAuthentication = ClientSecretPost(options.clientSecret)
     const execute: ((configuration: Configuration) => void)[] = [enableNonRepudiationChecks]
     if (options.allowInsecureHttp) {
+      // oxlint-disable-next-line typescript/no-deprecated -- Explicitly gated to loopback development URLs above.
       execute.push(allowInsecureRequests)
     }
     const oidc = await discovery(

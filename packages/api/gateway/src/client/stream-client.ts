@@ -267,6 +267,7 @@ export class RemoteStreamMuxClient {
         reject: (error) => {
           cleanup()
           // AbortSignal.reason belongs to the caller and may intentionally be a non-Error sentinel.
+          // oxlint-disable-next-line typescript/prefer-promise-reject-errors
           reject(error)
         },
       }
