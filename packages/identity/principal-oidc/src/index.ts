@@ -452,8 +452,10 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     }
     try {
       this.assertApplicationAuthority(request)
-      const sessionId = cookieValue(request.headers, SESSION_COOKIE)
-      if (sessionId !== undefined && isOpaqueId(sessionId)) this.revokeSession(sessionId, 'OIDC front-channel logout')
+      const sessionIds = cookieValues(request.headers, SESSION_COOKIE)
+      for (const sessionId of new Set(sessionIds)) {
+        if (isOpaqueId(sessionId)) this.revokeSession(sessionId, 'OIDC front-channel logout')
+      }
       response.setHeader?.('set-cookie', clearCookie(SESSION_COOKIE, '/', this.options.secureCookies))
       const metadata = this.oidc.serverMetadata()
       const location = metadata.end_session_endpoint === undefined
@@ -959,14 +961,18 @@ function headerValue(
 }
 
 function cookieValue(headers: PrincipalRequest['headers'], name: string): string | undefined {
+  const values = cookieValues(headers, name)
+  return values.length === 1 ? values[0] : undefined
+}
+
+function cookieValues(headers: PrincipalRequest['headers'], name: string): string[] {
   const cookie = headerValue(headers, 'cookie')
-  if (cookie === undefined) return undefined
-  let found: string | undefined
+  if (cookie === undefined) return []
+  const found: string[] = []
   for (const part of cookie.split(';')) {
     const index = part.indexOf('=')
     if (index < 0 || part.slice(0, index).trim() !== name) continue
-    if (found !== undefined) return undefined
-    found = part.slice(index + 1).trim()
+    found.push(part.slice(index + 1).trim())
   }
   return found
 }

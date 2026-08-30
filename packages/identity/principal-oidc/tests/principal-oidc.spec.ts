@@ -721,6 +721,33 @@ describe('OIDC Principal provider', () => {
     await expect(provider.processBackchannelLogout(logoutToken)).rejects.toThrow('replayed')
   })
 
+  it('revokes every valid local session candidate when duplicate session cookies are supplied', async () => {
+    const provider = await createProvider()
+    const first = await activeSession(provider)
+    const second = await activeSession(provider)
+    const logout = new TestResponse()
+
+    provider.handleLogout({
+      method: 'POST',
+      url: '/.dsh/oidc/logout',
+      headers: {
+        host: APP_HOST,
+        cookie: `${first.cookie}; ${second.cookie}`,
+        origin: APP_ORIGIN,
+      },
+    }, logout)
+
+    expect(logout.status).toBe(303)
+    expect(first.context.invalidated.aborted).toBe(true)
+    expect(second.context.invalidated.aborted).toBe(true)
+    for (const cookie of [first.cookie, second.cookie]) {
+      await expect(provider.authenticate({
+        url: '/api',
+        headers: { host: APP_HOST, cookie },
+      })).rejects.toMatchObject({ status: 401 })
+    }
+  })
+
   it('retains replay hashes for every instant when the original logout token remains valid', async () => {
     const provider = await createProvider()
     await provider.processBackchannelLogout(await issuer.logoutToken({ sid: 'jwks-warmup', jti: 'jwks-warmup' }))
