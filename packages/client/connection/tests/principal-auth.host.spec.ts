@@ -20,15 +20,16 @@ function authenticatedContext() {
   }
 }
 
-async function mounted(provider?: PrincipalProvider) {
+async function mounted(provider?: PrincipalProvider, browserAuth: BrowserAuth = {
+  isAuthenticated: () => false,
+  authenticatedUrl: () => 'http://127.0.0.1:3080/?token=legacy-launch-token',
+} as unknown as BrowserAuth) {
   const root = new Context()
   let connection!: HostConnectionService
   let principals!: PrincipalContextService
   const fiber = root.plugin((ctx) => {
     principals = new PrincipalContextService(ctx)
-    connection = new HostConnectionService(ctx, [], {
-      isAuthenticated: () => false,
-    } as unknown as BrowserAuth, {
+    connection = new HostConnectionService(ctx, [], browserAuth, {
       principalMode: 'required',
       principalProvider: () => provider,
       principals: () => principals,
@@ -100,6 +101,19 @@ describe('Connection Principal authentication', () => {
     } as unknown as PrincipalProvider)
     await expect(unavailable.connection.authenticateRequest(trustedRequest)).resolves.toEqual({ ok: false, rejection: 503 })
     await unavailable.dispose()
+  })
+
+  it('uses a clean root URL instead of a BrowserAuth launch token in required Principal mode', async () => {
+    const legacyUrl = vi.fn(() => 'http://127.0.0.1:3080/?token=legacy-launch-token')
+    const { connection, dispose } = await mounted({} as PrincipalProvider, {
+      isAuthenticated: () => false,
+      authenticatedUrl: legacyUrl,
+    } as unknown as BrowserAuth)
+
+    expect(connection.authenticatedUrl('http://127.0.0.1:3080/quote?projectId=ignored#ignored'))
+      .toBe('http://127.0.0.1:3080/')
+    expect(legacyUrl).not.toHaveBeenCalled()
+    await dispose()
   })
 
   it('rejects empty required contexts before direct, exact, or shared dispatch', async () => {

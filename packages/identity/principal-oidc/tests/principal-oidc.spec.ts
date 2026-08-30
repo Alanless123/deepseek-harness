@@ -424,6 +424,20 @@ describe('OIDC Principal provider', () => {
     })).rejects.toMatchObject({ status: 401 })
   })
 
+  it('strips OAuth query credentials from the callback return while preserving business parameters', async () => {
+    issuer.mode = 'valid'
+    issuer.introspectionActive = true
+    issuer.introspectionOutage = false
+    const provider = await createProvider()
+    const login = await beginLogin(
+      provider,
+      '/quotes/current?projectId=sanitized-project&tab=review&token=legacy-secret&code=oauth-code&state=oauth-state',
+    )
+    const callback = await completeLogin(provider, login)
+    expect(callback.status).toBe(303)
+    expect(stringHeader(callback, 'location')).toBe('/quotes/current?projectId=sanitized-project&tab=review')
+  })
+
   it.each([
     ['state', 'state', 401],
     ['PKCE', 'pkce', 401],

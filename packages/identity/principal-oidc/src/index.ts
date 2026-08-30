@@ -55,6 +55,11 @@ const MAX_REVALIDATE_INTERVAL_SECONDS = 60
 const MIN_STREAM_REVALIDATE_INTERVAL_MS = 1_000
 const MAX_LOGOUT_TOKEN_IDS = 20_000
 const MAX_LOGOUT_TARGET_TOMBSTONES = 20_000
+const RETURN_QUERY_SENSITIVE_NAMES = new Set([
+  'access_token', 'refresh_token', 'id_token', 'token', 'code', 'state',
+  'session_state', 'nonce', 'code_verifier', 'code_challenge',
+  'login_hint', 'logout_hint', 'id_token_hint', 'dsh_oidc_session',
+])
 
 /** OIDC client and in-memory Host session configuration. */
 export interface Config {
@@ -936,7 +941,11 @@ function requestUrl(request: PrincipalRequest, application: URL): URL {
 
 function safeReturnTo(url: URL, options: ResolvedConfig): string {
   if (url.origin !== options.redirectUri.origin || url.pathname === options.callbackPath) return '/'
-  return `${url.pathname}${url.search}`
+  const safe = new URL(url.href)
+  for (const name of [...safe.searchParams.keys()]) {
+    if (RETURN_QUERY_SENSITIVE_NAMES.has(name.toLowerCase())) safe.searchParams.delete(name)
+  }
+  return `${safe.pathname}${safe.search}`
 }
 
 function headerValue(

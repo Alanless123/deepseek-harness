@@ -115,7 +115,9 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const connection = new HostConnectionService(
     ctx,
     trustedHosts,
-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    principalMode === 'required'
+      ? undefined
+      : await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
     {
       principalMode,
       principalProvider: () => ctx.get('principalProvider'),

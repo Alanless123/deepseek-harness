@@ -73,12 +73,13 @@ export class HostConnectionService extends Service implements HostConnectionHand
    * Provide the Host half over the active HTTP server.
    * @param ctx - owning Connection plugin context.
    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
-   * @param browserAuth - process token and persistent browser-session owner.
+   * @param browserAuth - process token and persistent browser-session owner;
+   *   omitted when an authenticated Principal provider owns the index/session.
    */
   constructor(
     ctx: Context,
     private readonly trustedHosts: readonly string[],
-    private readonly browserAuth: BrowserAuth,
+    private readonly browserAuth: BrowserAuth | undefined,
     private readonly principalOptions: HostPrincipalOptions = {},
   ) {
     super(ctx, 'connection')
@@ -106,14 +107,14 @@ export class HostConnectionService extends Service implements HostConnectionHand
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
     if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
     if (this.principalOptions.principalMode === 'required') return 503
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
+    return this.requireBrowserAuth().isAuthenticated(request) ? undefined : 401
   }
 
   /** Authenticate before request decoding and mint the Host-only dispatch context. */
   async authenticateRequest(request: ConnectionTrustRequest): Promise<ConnectionRequestAuthentication> {
     if (!isTrustedApiRequest(request, this.trustedHosts)) return { ok: false, rejection: 403 }
     if (this.principalOptions.principalMode !== 'required') {
-      return this.browserAuth.isAuthenticated(request)
+      return this.requireBrowserAuth().isAuthenticated(request)
         ? { ok: true, context: {} }
         : { ok: false, rejection: 401 }
     }
@@ -174,12 +175,31 @@ export class HostConnectionService extends Service implements HostConnectionHand
       }
       return provider.authorizeIndex(request, response)
     }
-    return this.browserAuth.authorizeIndex(request, response)
+    return this.requireBrowserAuth().authorizeIndex(request, response)
   }
 
-  /** Add this process's launch token to the clean application URL. */
+  /**
+   * Resolve the browser entry URL without exposing a legacy launch token when
+   * this Host delegates index authentication to an authenticated Principal
+   * provider. OIDC owns that redirect and session; BrowserAuth is neither
+   * needed nor permitted on the public startup URL in this mode.
+   */
   authenticatedUrl(baseUrl: string): string {
-    return this.browserAuth.authenticatedUrl(baseUrl)
+    if (this.principalOptions.principalMode === 'required') {
+      const url = new URL(baseUrl)
+      url.pathname = '/'
+      url.search = ''
+      url.hash = ''
+      return url.href
+    }
+    return this.requireBrowserAuth().authenticatedUrl(baseUrl)
+  }
+
+  private requireBrowserAuth(): BrowserAuth {
+    if (this.browserAuth === undefined) {
+      throw new Error('connection: BrowserAuth is unavailable in required Principal mode')
+    }
+    return this.browserAuth
   }
 
   /**

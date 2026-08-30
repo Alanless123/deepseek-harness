@@ -10,7 +10,7 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { WebServer, WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { API_PATH, RpcId, apply, inject, type ClientRequest, type HostConnectionHandle } from '../src/index.ts'
 import { DEFAULT_MAX_REQUEST_BODY_BYTES } from '../src/http-bridge.ts'
-import { provideBrowserCredentials } from './browser-credentials.ts'
+import { provideBrowserCredentials, RecordCredentials } from './browser-credentials.ts'
 
 /** Structural webServer fake recording both route registries. */
 function fakeHttpServer(
@@ -131,6 +131,22 @@ describe('connection node half', () => {
     await expect(apply(ctx, { maxRequestBodyBytes: 1024 }))
       .rejects.toThrow(/must be at least .* aggregate image limit/)
     expect(routes).toHaveLength(0)
+  })
+
+  it('does not initialize legacy BrowserAuth credentials in required Principal mode', async () => {
+    const ctx = new Context()
+    const routes: WebRoute[] = []
+    const credentials = new RecordCredentials()
+    ctx.provide('credentials', credentials as never)
+    ctx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
+    const fiber = ctx.plugin({ inject: [...inject], apply }, { principalMode: 'required' })
+    await fiber.await()
+
+    expect(credentials.modifies).toBe(0)
+    const connection = ctx.get('connection') as HostConnectionHandle
+    expect(connection.authenticatedUrl('http://127.0.0.1:3080/quote?projectId=ignored#ignored'))
+      .toBe('http://127.0.0.1:3080/')
+    await fiber.dispose()
   })
 
   it('fails the load on a trustedHosts entry that is not a bare authority', async () => {
