@@ -256,7 +256,10 @@ async function sweepSessionDir(dir: string, cutoffMs: number, warn: WarnFn): Pro
     // utimes and stat can round the same instant to opposite sub-millisecond
     // floats across filesystems. Cleanup periods are day-scale, so compare at
     // Node's stable integer-millisecond boundary while preserving strict `<`.
-    if (Math.trunc(stats.mtimeMs) >= Math.trunc(cutoffMs)) continue
+    // Filesystems may round an `utimes` boundary down by one millisecond.
+    // Keep that representational boundary while still expiring files that are
+    // at least two integer milliseconds older than the cutoff.
+    if (Math.trunc(stats.mtimeMs) + 1 >= Math.trunc(cutoffMs)) continue
     await unlinkIdempotent(path, warn)
     remaining--
   }

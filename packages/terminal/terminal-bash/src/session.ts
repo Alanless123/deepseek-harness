@@ -509,8 +509,14 @@ export class LocalPtySession implements TerminalBackendSession {
       // A complete controlled prompt is stronger evidence than generic silence,
       // but it is not authoritative until the shell owns the foreground again.
       // Keep polling instead of downgrading that evidence under a loaded host.
-      if (startupHasOutput && !this.promptTextSeen
-        && idleFor >= this.config.idleSilenceMs + handoffGrace) {
+      const fallbackSilence = this.config.idleSilenceMs + handoffGrace
+      // Pwsh can deliver the prompt function output after a loaded runner's
+      // first silence window. Keep the fallback bounded, but leave enough time
+      // for the real prompt/foreground evidence to arrive.
+      const boundedFallbackSilence = this.config.shellDialect === 'pwsh'
+        ? Math.max(fallbackSilence, 2_000)
+        : fallbackSilence
+      if (startupHasOutput && !this.promptTextSeen && idleFor >= boundedFallbackSilence) {
         this.settleActive('inferred_idle')
       }
     } catch (error: unknown) {
