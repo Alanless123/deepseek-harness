@@ -218,7 +218,7 @@ async function unlinkIdempotent(path: string, warn: WarnFn): Promise<void> {
  * contained: one unreadable file does not abort the directory.
  *
  * @param dir The absolute session directory to scan (already confirmed a real dir).
- * @param cutoffMs Files with `mtime` strictly older than this are deleted.
+ * @param cutoffMs Files with an integer-millisecond `mtime` strictly older than this are deleted.
  * @param warn Sink for contained filesystem failures.
  * @returns `true` when the directory holds no entries after the sweep (a prune candidate).
  */
@@ -253,7 +253,10 @@ async function sweepSessionDir(dir: string, cutoffMs: number, warn: WarnFn): Pro
     // Only regular files expire. Symlinks and other special entries are skipped
     // (never followed) so the sweep cannot be redirected or delete a link.
     if (!stats.isFile()) continue
-    if (stats.mtimeMs >= cutoffMs) continue
+    // utimes and stat can round the same instant to opposite sub-millisecond
+    // floats across filesystems. Cleanup periods are day-scale, so compare at
+    // Node's stable integer-millisecond boundary while preserving strict `<`.
+    if (Math.trunc(stats.mtimeMs) >= Math.trunc(cutoffMs)) continue
     await unlinkIdempotent(path, warn)
     remaining--
   }

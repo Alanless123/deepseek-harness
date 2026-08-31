@@ -275,6 +275,17 @@ describe('startup cleanup sweep', () => {
     expect(existsSync(boundary)).toBe(true)
   })
 
+  it('deletes a file at least one integer millisecond before the boundary', async () => {
+    const dir = sessionDir(root, 'sess-1')
+    mkdirSync(dir, { recursive: true })
+    const cutoffMs = Date.now() - 30 * DAY_MS
+    const expired = join(dir, 'expired.txt')
+    writeFileSync(expired, 'x')
+    utimesSync(expired, (cutoffMs - 2) / 1000, (cutoffMs - 2) / 1000)
+    await sweepSpillRoots({ roots: [active(root)], cutoffMs, warn: () => {} })
+    expect(existsSync(expired)).toBe(false)
+  })
+
   it('disabled (cleanupPeriodDays: 0) sweeps nothing', async () => {
     const dir = sessionDir(root, 'sess-1')
     mkdirSync(dir, { recursive: true })

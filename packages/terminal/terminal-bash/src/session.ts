@@ -502,12 +502,15 @@ export class LocalPtySession implements TerminalBackendSession {
         this.settleActive('stdin_read')
         return
       }
-      // A prompt candidate can race bash's foreground handoff, but an interactive
-      // child also inherits PROMPT_COMMAND. Silence therefore remains the bound
-      // on waiting for shell ownership instead of letting a child marker suppress
-      // readiness until the absolute timeout.
+      // A prompt candidate can race bash's foreground handoff, while an
+      // interactive child may emit a non-controlled prompt marker. Silence is
+      // the fallback only until the complete controlled prompt is present.
       const handoffGrace = this.promptSeen ? this.config.handoffGraceMs : 0
-      if (startupHasOutput && idleFor >= this.config.idleSilenceMs + handoffGrace) {
+      // A complete controlled prompt is stronger evidence than generic silence,
+      // but it is not authoritative until the shell owns the foreground again.
+      // Keep polling instead of downgrading that evidence under a loaded host.
+      if (startupHasOutput && !this.promptTextSeen
+        && idleFor >= this.config.idleSilenceMs + handoffGrace) {
         this.settleActive('inferred_idle')
       }
     } catch (error: unknown) {

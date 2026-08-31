@@ -1188,6 +1188,31 @@ describe('LocalPtySession readiness and output', () => {
     expect((await operation.done).waitReason).toBe('stdin_read')
   })
 
+  it('does not downgrade a complete controlled prompt while shell ownership is delayed', async () => {
+    vi.useFakeTimers()
+    const terminal = new FakeTerminal()
+    const inspector = new FakeInspector()
+    const session = makeSession(terminal, inspector, config({
+      handoffGraceMs: 40,
+      timeoutMs: 300,
+    }))
+    await initialize(session, terminal)
+
+    const operation = session.startSend({ text: 'run', submit: true })
+    let settled = false
+    void operation.done.then(() => { settled = true })
+    await Promise.resolve()
+    await Promise.resolve()
+    inspector.pgid = 789
+    terminal.emitData('\x1b]133;D;0\x07dsh> ')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(settled).toBe(false)
+
+    inspector.pgid = 456
+    await vi.advanceTimersByTimeAsync(10)
+    expect((await operation.done).waitReason).toBe('stdin_read')
+  })
+
   it('falls back to inferred idle when a foreground child emits an inherited prompt marker', async () => {
     vi.useFakeTimers()
     const terminal = new FakeTerminal()
