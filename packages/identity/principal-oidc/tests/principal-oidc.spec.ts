@@ -12,6 +12,13 @@ const APP_ORIGIN = 'http://127.0.0.1:47891'
 const APP_HOST = '127.0.0.1:47891'
 const CALLBACK_PATH = '/.dsh/oidc/callback'
 const CALLBACK_URI = `${APP_ORIGIN}${CALLBACK_PATH}`
+const SECURE_APP_ORIGIN = 'https://cpq.example.test'
+const SECURE_APP_HOST = 'cpq.example.test'
+const SECURE_CALLBACK_URI = `${SECURE_APP_ORIGIN}${CALLBACK_PATH}`
+const DEV_SESSION_COOKIE = 'dsh_oidc_dev_session'
+const DEV_TRANSACTION_COOKIE = 'dsh_oidc_dev_transaction'
+const SECURE_SESSION_COOKIE = '__Host-dsh_oidc_session'
+const SECURE_TRANSACTION_COOKIE = '__Host-dsh_oidc_transaction'
 
 type TokenMode =
   | 'valid'
@@ -217,7 +224,9 @@ class MockIssuer {
       const form = new URLSearchParams(await requestBody(request))
       const verifier = form.get('code_verifier') ?? ''
       this.pkceVerified = await calculatePKCECodeChallenge(verifier) === this.expectedChallenge
-      if (this.mode === 'pkce' || !this.pkceVerified || form.get('redirect_uri') !== CALLBACK_URI) {
+      if (this.mode === 'pkce'
+        || !this.pkceVerified
+        || ![CALLBACK_URI, SECURE_CALLBACK_URI].includes(form.get('redirect_uri') ?? '')) {
         json(response, 400, { error: 'invalid_grant' })
         return
       }
@@ -315,29 +324,35 @@ async function createProvider(overrides: Partial<Config> = {}): Promise<OidcPrin
   return OidcPrincipalProvider.create(new Context(), providerConfig(overrides))
 }
 
-async function beginLogin(provider: OidcPrincipalProvider, returnTo = '/quotes/current?tab=review') {
+async function beginLogin(
+  provider: OidcPrincipalProvider,
+  returnTo = '/quotes/current?tab=review',
+  applicationHost = APP_HOST,
+  transactionCookie = DEV_TRANSACTION_COOKIE,
+) {
   const response = new TestResponse()
   expect(await provider.authorizeIndex({
     method: 'GET',
     url: returnTo,
-    headers: { host: APP_HOST },
+    headers: { host: applicationHost },
   }, response)).toBe(false)
   expect(response.status).toBe(302)
   const location = new URL(stringHeader(response, 'location'))
   issuer.rememberAuthorization(location)
-  return { response, location, transactionCookie: responseCookie(response, 'dsh_oidc_transaction') }
+  return { response, location, transactionCookie: responseCookie(response, transactionCookie) }
 }
 
 async function completeLogin(
   provider: OidcPrincipalProvider,
   login: Awaited<ReturnType<typeof beginLogin>>,
   state = login.location.searchParams.get('state') ?? '',
+  applicationHost = APP_HOST,
 ): Promise<TestResponse> {
   const response = new TestResponse()
   await provider.handleCallback({
     method: 'GET',
     url: `${CALLBACK_PATH}?code=authorization-code&state=${encodeURIComponent(state)}`,
-    headers: { host: APP_HOST, cookie: login.transactionCookie },
+    headers: { host: applicationHost, cookie: login.transactionCookie },
   }, response)
   return response
 }
@@ -348,7 +363,7 @@ async function activeSession(provider: OidcPrincipalProvider) {
   issuer.introspectionOutage = false
   const callback = await completeLogin(provider, await beginLogin(provider))
   expect(callback.status).toBe(303)
-  const cookie = responseCookie(callback, 'dsh_oidc_session')
+  const cookie = responseCookie(callback, DEV_SESSION_COOKIE)
   const context = await provider.authenticate({ url: '/api', headers: { host: APP_HOST, cookie } })
   return { callback, cookie, context }
 }
@@ -390,12 +405,22 @@ describe('OIDC Principal provider', () => {
     expect(login.location.searchParams.get('code_challenge')).toMatch(/^[A-Za-z0-9_-]{43}$/u)
     expect(login.location.searchParams.get('state')).toBeTruthy()
     expect(login.location.searchParams.get('nonce')).toBeTruthy()
+    const transactionSetCookie = responseCookieHeader(login.response, DEV_TRANSACTION_COOKIE)
+    expect(transactionSetCookie).toContain('; Path=/;')
+    expect(transactionSetCookie).toContain('; HttpOnly; SameSite=Lax')
+    expect(transactionSetCookie).not.toContain('; Secure')
+    expect(transactionSetCookie).not.toMatch(/;\s*Domain=/iu)
 
     const callback = await completeLogin(provider, login)
     expect(callback.status).toBe(303)
     expect(stringHeader(callback, 'location')).toBe('/quotes/current?tab=review')
     expect(issuer.pkceVerified).toBe(true)
-    const sessionCookie = responseCookie(callback, 'dsh_oidc_session')
+    const sessionCookie = responseCookie(callback, DEV_SESSION_COOKIE)
+    const sessionSetCookie = responseCookieHeader(callback, DEV_SESSION_COOKIE)
+    expect(sessionSetCookie).toContain('; Path=/;')
+    expect(sessionSetCookie).toContain('; HttpOnly; SameSite=Lax')
+    expect(sessionSetCookie).not.toContain('; Secure')
+    expect(sessionSetCookie).not.toMatch(/;\s*Domain=/iu)
     const opaqueValue = sessionCookie.split('=', 2)[1]
     expect(opaqueValue).toMatch(/^[A-Za-z0-9_-]{43}$/u)
     expect(opaqueValue).not.toContain('.')
@@ -422,8 +447,105 @@ describe('OIDC Principal provider', () => {
     expect(JSON.stringify(context)).not.toContain('private_role')
     await expect(provider.authenticate({
       url: '/api',
-      headers: { host: APP_HOST, cookie: 'dsh_oidc_session=forged' },
+      headers: { host: APP_HOST, cookie: `${DEV_SESSION_COOKIE}=forged` },
     })).rejects.toMatchObject({ status: 401 })
+  })
+
+  it('uses __Host cookies on HTTPS and rejects sibling-domain legacy fixation', async () => {
+    issuer.mode = 'valid'
+    issuer.introspectionActive = true
+    issuer.introspectionOutage = false
+    const provider = await createProvider({
+      redirectUri: SECURE_CALLBACK_URI,
+      postLogoutRedirectUri: `${SECURE_APP_ORIGIN}/signed-out`,
+    })
+    const login = await beginLogin(
+      provider,
+      '/quotes/current?tab=review',
+      SECURE_APP_HOST,
+      SECURE_TRANSACTION_COOKIE,
+    )
+    const transactionSetCookie = responseCookieHeader(login.response, SECURE_TRANSACTION_COOKIE)
+    expect(transactionSetCookie).toContain('; Path=/;')
+    expect(transactionSetCookie).toContain('; HttpOnly; SameSite=Lax; Secure')
+    expect(transactionSetCookie).not.toMatch(/;\s*Domain=/iu)
+
+    const transactionValue = login.transactionCookie.split('=', 2)[1]!
+    const duplicateTransaction = await completeLogin(
+      provider,
+      { ...login, transactionCookie: `${login.transactionCookie}; ${login.transactionCookie}` },
+      undefined,
+      SECURE_APP_HOST,
+    )
+    expect(duplicateTransaction.status).toBe(401)
+    expect(() => responseCookie(duplicateTransaction, SECURE_SESSION_COOKIE)).toThrow()
+    const untrustedTransactions = [
+      `dsh_oidc_transaction=${transactionValue}`,
+      `${DEV_TRANSACTION_COOKIE}=${transactionValue}`,
+    ]
+    for (const transactionCookie of untrustedTransactions) {
+      const blockedCallback = await completeLogin(
+        provider,
+        { ...login, transactionCookie },
+        undefined,
+        SECURE_APP_HOST,
+      )
+      expect(blockedCallback.status).toBe(401)
+      expect(() => responseCookie(blockedCallback, SECURE_SESSION_COOKIE)).toThrow()
+    }
+
+    const callback = await completeLogin(
+      provider,
+      { ...login, transactionCookie: `${untrustedTransactions.join('; ')}; ${login.transactionCookie}` },
+      undefined,
+      SECURE_APP_HOST,
+    )
+    expect(callback.status).toBe(303)
+    const sessionCookie = responseCookie(callback, SECURE_SESSION_COOKIE)
+    const sessionSetCookie = responseCookieHeader(callback, SECURE_SESSION_COOKIE)
+    expect(sessionSetCookie).toContain('; Path=/;')
+    expect(sessionSetCookie).toContain('; HttpOnly; SameSite=Lax; Secure')
+    expect(sessionSetCookie).not.toMatch(/;\s*Domain=/iu)
+
+    const sessionValue = sessionCookie.split('=', 2)[1]!
+    const untrustedSessions = [
+      `dsh_oidc_session=${sessionValue}`,
+      `${DEV_SESSION_COOKIE}=${sessionValue}`,
+    ]
+    for (const cookie of untrustedSessions) {
+      await expect(provider.authenticate({
+        url: '/api',
+        headers: { host: SECURE_APP_HOST, cookie },
+      })).rejects.toMatchObject({ status: 401 })
+    }
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: SECURE_APP_HOST, cookie: `${untrustedSessions.join('; ')}; ${sessionCookie}` },
+    })).resolves.toMatchObject({ principal: { subject: 'alice' } })
+    await expect(provider.authenticate({
+      url: '/api',
+      headers: { host: SECURE_APP_HOST, cookie: `${sessionCookie}; ${sessionCookie}` },
+    })).rejects.toMatchObject({ status: 401 })
+
+    const context = await provider.authenticate({
+      url: '/api',
+      headers: { host: SECURE_APP_HOST, cookie: sessionCookie },
+    })
+    const logout = new TestResponse()
+    provider.handleLogout({
+      method: 'POST',
+      url: '/.dsh/oidc/logout',
+      headers: {
+        host: SECURE_APP_HOST,
+        cookie: `${untrustedSessions.join('; ')}; ${sessionCookie}`,
+        origin: SECURE_APP_ORIGIN,
+      },
+    }, logout)
+    expect(logout.status).toBe(303)
+    expect(logout.header('set-cookie')).toBe(
+      `${SECURE_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure`,
+    )
+    expect(context.invalidated.aborted).toBe(true)
   })
 
   it('strips OAuth query credentials from the callback return while preserving business parameters', async () => {
@@ -467,7 +589,7 @@ describe('OIDC Principal provider', () => {
     const callback = await completeLogin(provider, login, mode === 'state' ? 'forged-state' : undefined)
     expect(callback.status).toBe(expectedStatus)
     expect(callback.body).not.toContain('authorization-code')
-    expect(() => responseCookie(callback, 'dsh_oidc_session')).toThrow()
+    expect(() => responseCookie(callback, DEV_SESSION_COOKIE)).toThrow()
   })
 
   it('rejects discovery whose returned issuer differs from the configured issuer', async () => {
@@ -597,7 +719,7 @@ describe('OIDC Principal provider', () => {
     const callback = await completeLogin(provider, login)
     expect(callback.status).toBe(503)
     expect(callback.body).toBe('identity provider unavailable')
-    expect(() => responseCookie(callback, 'dsh_oidc_session')).toThrow()
+    expect(() => responseCookie(callback, DEV_SESSION_COOKIE)).toThrow()
   })
 
   it('does not establish a session after matching back-channel logout wins the callback race', async () => {
@@ -619,7 +741,7 @@ describe('OIDC Principal provider', () => {
     const callback = await callbackPending
     expect(callback.status).toBe(401)
     expect(callback.body).toBe('unauthorized')
-    expect(() => responseCookie(callback, 'dsh_oidc_session')).toThrow()
+    expect(() => responseCookie(callback, DEV_SESSION_COOKIE)).toThrow()
   })
 
   it('does not restore a session when back-channel logout wins a revalidation race', async () => {
@@ -660,7 +782,8 @@ describe('OIDC Principal provider', () => {
 
     expect(response.status).toBe(401)
     const issued = response.setCookieHistory.flatMap(value => typeof value === 'string' ? [value] : value)
-      .find(value => value.startsWith('dsh_oidc_session=') && !value.startsWith('dsh_oidc_session=;'))
+      .find(value => value.startsWith(`${DEV_SESSION_COOKIE}=`)
+        && !value.startsWith(`${DEV_SESSION_COOKIE}=;`))
     expect(issued).toBeDefined()
     await expect(provider.authenticate({
       url: '/api',
@@ -896,12 +1019,16 @@ function stringHeader(response: TestResponse, name: string): string {
   return value
 }
 
-function responseCookie(response: TestResponse, name: string): string {
+function responseCookieHeader(response: TestResponse, name: string): string {
   const value = response.header('set-cookie')
   const values = typeof value === 'string' ? [value] : value ?? []
   const match = values.find(entry => entry.startsWith(`${name}=`) && !entry.startsWith(`${name}=;`))
   if (match === undefined) throw new Error(`missing ${name} response cookie`)
-  return match.split(';', 1)[0]!
+  return match
+}
+
+function responseCookie(response: TestResponse, name: string): string {
+  return responseCookieHeader(response, name).split(';', 1)[0]!
 }
 
 it('uses stable authentication errors without leaking protocol material', () => {

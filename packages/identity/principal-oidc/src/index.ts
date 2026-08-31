@@ -41,8 +41,11 @@ import {
   RESPONSE_IS_NOT_JSON,
 } from 'oauth4webapi'
 
-const SESSION_COOKIE = 'dsh_oidc_session'
-const TRANSACTION_COOKIE = 'dsh_oidc_transaction'
+const SECURE_SESSION_COOKIE = '__Host-dsh_oidc_session'
+const SECURE_TRANSACTION_COOKIE = '__Host-dsh_oidc_transaction'
+const LOOPBACK_SESSION_COOKIE = 'dsh_oidc_dev_session'
+const LOOPBACK_TRANSACTION_COOKIE = 'dsh_oidc_dev_transaction'
+const COOKIE_PATH = '/'
 const BACKCHANNEL_LOGOUT_EVENT = 'http://schemas.openid.net/event/backchannel-logout'
 const DEFAULT_LOGOUT_PATH = '/.dsh/oidc/logout'
 const DEFAULT_BACKCHANNEL_LOGOUT_PATH = '/.dsh/oidc/backchannel-logout'
@@ -57,7 +60,10 @@ const MAX_LOGOUT_TARGET_TOMBSTONES = 20_000
 const RETURN_QUERY_SENSITIVE_NAMES = new Set([
   'access_token', 'refresh_token', 'id_token', 'token', 'code', 'state',
   'session_state', 'nonce', 'code_verifier', 'code_challenge',
-  'login_hint', 'logout_hint', 'id_token_hint', 'dsh_oidc_session',
+  'login_hint', 'logout_hint', 'id_token_hint',
+  '__host-dsh_oidc_session', '__host-dsh_oidc_transaction',
+  'dsh_oidc_dev_session', 'dsh_oidc_dev_transaction',
+  'dsh_oidc_session', 'dsh_oidc_transaction',
 ])
 
 /** OIDC client and in-memory Host session configuration. */
@@ -134,6 +140,8 @@ interface ResolvedConfig {
   readonly logoutPath: string
   readonly backchannelLogoutPath: string
   readonly secureCookies: boolean
+  readonly sessionCookie: string
+  readonly transactionCookie: string
   readonly allowInsecureHttp: boolean
 }
 
@@ -242,7 +250,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
   /** Authenticate an opaque Host session cookie and periodically introspect it. */
   override async authenticate(request: PrincipalRequest): Promise<AuthenticatedPrincipalContext> {
     this.assertApplicationAuthority(request)
-    const sessionId = cookieValue(request.headers, SESSION_COOKIE)
+    const sessionId = cookieValue(request.headers, this.options.sessionCookie)
     if (sessionId === undefined || !isOpaqueId(sessionId)) throw unauthenticated()
     const session = this.sessions.get(sessionId)
     if (session === undefined) throw unauthenticated()
@@ -307,10 +315,10 @@ export class OidcPrincipalProvider extends PrincipalProvider {
         'referrer-policy': 'no-referrer',
         location: location.href,
         'set-cookie': serializeCookie(
-          TRANSACTION_COOKIE,
+          this.options.transactionCookie,
           transactionId,
           this.options.transactionTtlMs,
-          this.options.callbackPath,
+          COOKIE_PATH,
           this.options.secureCookies,
         ),
       })
@@ -346,8 +354,8 @@ export class OidcPrincipalProvider extends PrincipalProvider {
    */
   async handleCallback(request: PrincipalRequest, response: OidcResponse): Promise<void> {
     const clearTransaction = clearCookie(
-      TRANSACTION_COOKIE,
-      this.options.callbackPath,
+      this.options.transactionCookie,
+      COOKIE_PATH,
       this.options.secureCookies,
     )
     let transaction: LoginTransaction | undefined
@@ -355,7 +363,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     try {
       const callbackUrl = this.exactCallbackUrl(request)
       if (request.method !== undefined && request.method !== 'GET') throw new Error('callback method rejected')
-      const transactionId = cookieValue(request.headers, TRANSACTION_COOKIE)
+      const transactionId = cookieValue(request.headers, this.options.transactionCookie)
       if (transactionId === undefined || !isOpaqueId(transactionId)) throw new Error('login transaction missing')
       transaction = this.transactions.get(transactionId)
       this.transactions.delete(transactionId)
@@ -405,10 +413,10 @@ export class OidcPrincipalProvider extends PrincipalProvider {
       response.setHeader?.('set-cookie', [
         clearTransaction,
         serializeCookie(
-          SESSION_COOKIE,
+          this.options.sessionCookie,
           sessionId,
           expiresAt - now,
-          '/',
+          COOKIE_PATH,
           this.options.secureCookies,
         ),
       ])
@@ -423,7 +431,7 @@ export class OidcPrincipalProvider extends PrincipalProvider {
       }
       response.setHeader?.('set-cookie', [
         clearTransaction,
-        clearCookie(SESSION_COOKIE, '/', this.options.secureCookies),
+        clearCookie(this.options.sessionCookie, COOKIE_PATH, this.options.secureCookies),
       ])
       const status = isProviderFailure(error) ? 503 : 401
       response.writeHead(status, {
@@ -452,11 +460,14 @@ export class OidcPrincipalProvider extends PrincipalProvider {
     }
     try {
       this.assertApplicationAuthority(request)
-      const sessionIds = cookieValues(request.headers, SESSION_COOKIE)
+      const sessionIds = cookieValues(request.headers, this.options.sessionCookie)
       for (const sessionId of new Set(sessionIds)) {
         if (isOpaqueId(sessionId)) this.revokeSession(sessionId, 'OIDC front-channel logout')
       }
-      response.setHeader?.('set-cookie', clearCookie(SESSION_COOKIE, '/', this.options.secureCookies))
+      response.setHeader?.(
+        'set-cookie',
+        clearCookie(this.options.sessionCookie, COOKIE_PATH, this.options.secureCookies),
+      )
       const metadata = this.oidc.serverMetadata()
       const location = metadata.end_session_endpoint === undefined
         ? this.options.postLogoutRedirectUri
@@ -819,6 +830,8 @@ function resolveConfig(input: Config): ResolvedConfig {
     logoutPath,
     backchannelLogoutPath,
     secureCookies: redirectUri.protocol === 'https:',
+    sessionCookie: redirectUri.protocol === 'https:' ? SECURE_SESSION_COOKIE : LOOPBACK_SESSION_COOKIE,
+    transactionCookie: redirectUri.protocol === 'https:' ? SECURE_TRANSACTION_COOKIE : LOOPBACK_TRANSACTION_COOKIE,
     allowInsecureHttp,
   }
 }
