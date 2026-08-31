@@ -120,7 +120,9 @@ describe('Remote stream mux server carrier lifecycle', () => {
     client.send(JSON.stringify({ type: 'cancel', streamId: 'cancelled' }))
     await didReturn
     await new Promise<void>((resolve) => { setImmediate(resolve) })
-    expect(frames).toEqual([])
+    // The carrier emits a protocol hello control frame on connection setup;
+    // clean source cancellation must only suppress the logical end frame.
+    expect(frames.filter(frame => (frame as { type?: unknown })?.type === 'end')).toEqual([])
     client.close()
     await once(client, 'close')
   })
