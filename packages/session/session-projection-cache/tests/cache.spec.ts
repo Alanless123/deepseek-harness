@@ -132,8 +132,9 @@ async function seedRecord(
   await writeFile(path, JSON.stringify({ version: projectionCacheDomainSpec.version, record: { identity, rows } }))
 }
 
-/** Wait until queued fail-soft writes (event-listener fire-and-forget over real fs I/O) drain. */
-const settle = () => new Promise(resolve => setTimeout(resolve, 40))
+/** Poll a real-fs postcondition for queued fire-and-forget cache writes. */
+const waitForCache = (assertion: () => void | Promise<void>) =>
+  vi.waitFor(assertion, { timeout: 2000, interval: 10 })
 
 afterEach(async () => {
   vi.useRealTimers()
@@ -148,12 +149,14 @@ describe('SessionProjectionCache write policy', () => {
     mark(session, ['a'])
     // Creation already wrote the init cut; the mark is throttled, so the
     // stored row is still the creation-time cut (no marks folded).
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.seq).toBe(-1)
+    await waitForCache(async () => {
+      expect((await storedRows(root, session.id))?.['cache-test/marks']?.seq).toBe(-1)
+    })
     const end = endTurn(session)
-    await settle()
-    const rows = await storedRows(root, session.id)
-    expect(rows?.['cache-test/marks']).toEqual({ ver: 1, seq: end.seq, val: { marks: ['a'] } })
+    await waitForCache(async () => {
+      const rows = await storedRows(root, session.id)
+      expect(rows?.['cache-test/marks']).toEqual({ ver: 1, seq: end.seq, val: { marks: ['a'] } })
+    })
   })
 
   it('writes a checkpoint at session creation, capturing the seed-derived cut', async () => {
@@ -164,9 +167,10 @@ describe('SessionProjectionCache write policy', () => {
     const session = ctx.sessions.create(SessionId('seeded'), {
       seed: [{ type: 'cache-test/mark', seq: 0, time: 1, data: { marks: ['seed'] } }] as SessionEvent[],
     })
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.val)
-      .toEqual({ marks: ['seed'] })
+    await waitForCache(async () => {
+      expect((await storedRows(root, session.id))?.['cache-test/marks']?.val)
+        .toEqual({ marks: ['seed'] })
+    })
   })
 
   it('writes at session disposal (detach, the live-to-cold moment)', async () => {
@@ -177,10 +181,12 @@ describe('SessionProjectionCache write policy', () => {
       session = inner.sessions.create(SessionId('detach'))
     }, { inject: ['sessions'] }))
     if (session === undefined) throw new Error('session was not created')
-    mark(session, ['live'])
+    const disposedSession = session
+    mark(disposedSession, ['live'])
     await owner.dispose()
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.val).toEqual({ marks: ['live'] })
+    await waitForCache(async () => {
+      expect((await storedRows(root, disposedSession.id))?.['cache-test/marks']?.val).toEqual({ marks: ['live'] })
+    })
   })
 
   it('flushes when the in-turn event count reaches the configured threshold', async () => {
@@ -188,11 +194,13 @@ describe('SessionProjectionCache write policy', () => {
     const session = ctx.sessions.create(SessionId('count'))
     mark(session, ['1'])
     mark(session, ['2'])
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.seq).toBe(-1) // still the creation cut
+    await waitForCache(async () => {
+      expect((await storedRows(root, session.id))?.['cache-test/marks']?.seq).toBe(-1) // still the creation cut
+    })
     mark(session, ['3'])
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.val).toEqual({ marks: ['3'] })
+    await waitForCache(async () => {
+      expect((await storedRows(root, session.id))?.['cache-test/marks']?.val).toEqual({ marks: ['3'] })
+    })
   })
 
   it('flushes on the configured interval when the count threshold is not reached', async () => {
@@ -261,15 +269,17 @@ describe('SessionProjectionCache write policy', () => {
     const session = ctx.sessions.create(SessionId('fail-soft'))
     mark(session, ['x'])
     endTurn(session)
-    await settle()
+    await waitForCache(() => {
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('turn/end write for "fail-soft" failed'))
+    })
     expect(await storedRows(root, session.id)).toBeUndefined()
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('turn/end write for "fail-soft" failed'))
     // Self-heal: once the blocker clears, the next mandatory point writes.
     await rm(recordPath(root, session.id), { recursive: true })
     mark(session, ['y'])
     endTurn(session)
-    await settle()
-    expect((await storedRows(root, session.id))?.['cache-test/marks']?.val).toEqual({ marks: ['y'] })
+    await waitForCache(async () => {
+      expect((await storedRows(root, session.id))?.['cache-test/marks']?.val).toEqual({ marks: ['y'] })
+    })
   })
 })
 
@@ -415,15 +425,17 @@ describe('SessionProjectionCache cold-read seeding', () => {
     // Host-only unit: folded but not served; the refreshed row is written
     // back (fail-soft, fire-and-forget) once the write lands.
     expect(Object.keys(snapshot.values)).not.toContain('cache-test/count')
-    await settle()
-    expect((await storedRows(root, meta.id))?.['cache-test/count']?.seq).toBe(4)
+    await waitForCache(async () => {
+      expect((await storedRows(root, meta.id))?.['cache-test/count']?.seq).toBe(4)
+    })
     // No cached row yet: the first cold read folds from init over the full
     // log and creates the cache row (the `?? {}` seed path).
     const fresh = headerOf(SessionId('cold-fresh'), 10)
     cache.coldSnapshot(fresh, events)
     expect(apply).toHaveBeenCalledTimes(7) // 2 tail + 5 full
-    await settle()
-    expect((await storedRows(root, fresh.id))?.['cache-test/count']?.seq).toBe(4)
+    await waitForCache(async () => {
+      expect((await storedRows(root, fresh.id))?.['cache-test/count']?.seq).toBe(4)
+    })
   })
 
   it('coldSnapshot write-back is fail-soft: a failed durable write logs and never throws', async () => {
@@ -444,7 +456,8 @@ describe('SessionProjectionCache cold-read seeding', () => {
     const meta = headerOf(SessionId('cold-fail'))
     await mkdir(recordPath(root, meta.id), { recursive: true })
     expect(ctx.sessionProjectionCache.coldSnapshot(meta, [])).toBeDefined()
-    await settle()
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('cold-read write-back for "cold-fail" failed'))
+    await waitForCache(() => {
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('cold-read write-back for "cold-fail" failed'))
+    })
   })
 })
