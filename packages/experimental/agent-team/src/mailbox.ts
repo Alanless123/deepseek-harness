@@ -24,7 +24,7 @@ import type {
 export class TeamMailbox {
   private readonly dispatchTails = new Map<SessionId, Promise<void>>()
   private readonly activeDispatches = new Map<SessionId, TeamMessageSnapshot>()
-  private readonly inFlightMessages = new Set<TeamMessageId>()
+  private readonly inFlightMessages = new Map<Agent, Map<TeamMessageId, Promise<boolean>>>()
   private readonly inFlightDispatches = new Set<Promise<unknown>>()
 
   /**
@@ -154,8 +154,9 @@ export class TeamMailbox {
   /** Attempt one queued message exactly once in this process at a time. */
   private tryDispatch(root: Agent, message: TeamMessageSnapshot, signal: AbortSignal): Promise<boolean> {
     if (this.lifecycle.disposed) return Promise.resolve(false)
-    if (this.inFlightMessages.has(message.id)) return Promise.resolve(false)
-    this.inFlightMessages.add(message.id)
+    const teamMessages = this.inFlightMessages.get(root)
+    const inFlight = teamMessages?.get(message.id)
+    if (inFlight !== undefined) return this.observeInFlight(root, message, inFlight, signal)
     const operation = this.trackDispatch(
       this.tryDispatchAdmitted(
         root,
@@ -163,11 +164,49 @@ export class TeamMailbox {
         AbortSignal.any([signal, this.lifecycle.signal]),
       ),
     )
+    const registered = teamMessages ?? new Map<TeamMessageId, Promise<boolean>>()
+    if (teamMessages === undefined) this.inFlightMessages.set(root, registered)
+    registered.set(message.id, operation)
     const forget = (): void => {
-      this.inFlightMessages.delete(message.id)
+      this.forgetInFlight(root, message.id, operation)
     }
     void operation.then(forget, forget)
     return operation
+  }
+
+  /** Observe one shared attempt without transferring cancellation or a contained failure between callers. */
+  private async observeInFlight(
+    root: Agent,
+    message: TeamMessageSnapshot,
+    operation: Promise<boolean>,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted || this.lifecycle.disposed) return false
+    const cancellation = Promise.withResolvers<'cancelled'>()
+    const onAbort = (): void => {
+      cancellation.resolve('cancelled')
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      const outcome = await Promise.race([
+        operation.then(accepted => accepted ? 'accepted' as const : 'retry' as const),
+        cancellation.promise,
+      ])
+      if (outcome === 'cancelled') return false
+      if (outcome === 'accepted') return true
+      this.forgetInFlight(root, message.id, operation)
+      return await this.tryDispatch(root, message, signal)
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /** Remove one exact completed Team-message attempt without disturbing a newer retry. */
+  private forgetInFlight(root: Agent, messageId: TeamMessageId, operation: Promise<boolean>): void {
+    const teamMessages = this.inFlightMessages.get(root)
+    if (teamMessages?.get(messageId) !== operation) return
+    teamMessages.delete(messageId)
+    if (teamMessages.size === 0) this.inFlightMessages.delete(root)
   }
 
   /** Track one dispatch transaction through delivery admission or contained failure. */

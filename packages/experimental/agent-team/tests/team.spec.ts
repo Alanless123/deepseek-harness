@@ -899,6 +899,124 @@ describe('Team Remote API', () => {
 })
 
 describe('Team mailbox and waiting', () => {
+  it('shares an in-flight recovery dispatch with a foreground retry of the same message', async () => {
+    const { ctx, lead } = await setup([])
+    const message: TeamMessageSnapshot = {
+      id: TeamMessageId('recovery-foreground-race'),
+      senderId: SessionId('team-worker'),
+      senderName: 'worker',
+      targetId: lead.id,
+      delivery: 'quiet',
+      content: content('deliver exactly once'),
+    }
+    lead.session.append('team/message/queued', {
+      version: 1,
+      teamId: TeamId(lead.id),
+      message,
+    })
+    await ctx.sessions.flush(lead.session)
+
+    const flush = ctx.sessions.flush.bind(ctx.sessions)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    vi.spyOn(ctx.sessions, 'flush').mockImplementationOnce(async (session) => {
+      entered.resolve(undefined)
+      await release.promise
+      return flush(session)
+    })
+
+    const internal = teamInternals(ctx).mailbox
+    const recovery = internal.tryDispatch(lead, message, SIGNAL)
+    await entered.promise
+    const cancellation = new AbortController()
+    const cancelled = internal.tryDispatch(lead, message, cancellation.signal)
+    cancellation.abort({ kind: 'test' })
+    await expect(cancelled).resolves.toBe(false)
+    let foregroundSettled = false
+    const foreground = internal.tryDispatch(lead, message, SIGNAL)
+      .finally(() => { foregroundSettled = true })
+    await Promise.resolve()
+    expect(foregroundSettled).toBe(false)
+
+    release.resolve(undefined)
+    await expect(Promise.all([recovery, foreground])).resolves.toEqual([true, true])
+    expect(lead.inbox.nextStep.filter(input => input.source.kind === 'team-message'
+      && input.source.messageId === message.id)).toHaveLength(1)
+    expect(durable(lead).pendingMessages).toEqual([])
+  })
+
+  it('isolates in-flight message identities between exact Team roots', async () => {
+    const { ctx, lead } = await setup([])
+    const otherLead = ctx.agentLoop.create(SessionId('other-lead'), { provider: 'mock', model: 'mock' })
+    const id = TeamMessageId('root-local-message')
+    const firstMessage: TeamMessageSnapshot = {
+      id,
+      senderId: SessionId('first-worker'),
+      senderName: 'first-worker',
+      targetId: lead.id,
+      delivery: 'quiet',
+      content: content('first Team message'),
+    }
+    const secondMessage: TeamMessageSnapshot = {
+      id,
+      senderId: SessionId('second-worker'),
+      senderName: 'second-worker',
+      targetId: otherLead.id,
+      delivery: 'quiet',
+      content: content('second Team message'),
+    }
+    lead.session.append('team/message/queued', {
+      version: 1, teamId: TeamId(lead.id), message: firstMessage,
+    })
+    otherLead.session.append('team/message/queued', {
+      version: 1, teamId: TeamId(otherLead.id), message: secondMessage,
+    })
+    await Promise.all([ctx.sessions.flush(lead.session), ctx.sessions.flush(otherLead.session)])
+
+    const flush = ctx.sessions.flush.bind(ctx.sessions)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    vi.spyOn(ctx.sessions, 'flush').mockImplementationOnce(async (session) => {
+      entered.resolve(undefined)
+      await release.promise
+      return flush(session)
+    })
+
+    const internal = teamInternals(ctx).mailbox
+    const first = internal.tryDispatch(lead, firstMessage, SIGNAL)
+    await entered.promise
+    const second = internal.tryDispatch(otherLead, secondMessage, SIGNAL)
+    expect(otherLead.inbox.nextStep.filter(input => input.source.kind === 'team-message'
+      && input.source.messageId === id)).toHaveLength(1)
+
+    release.resolve(undefined)
+    await expect(Promise.all([first, second])).resolves.toEqual([true, true])
+    expect(lead.inbox.nextStep.filter(input => input.source.kind === 'team-message'
+      && input.source.messageId === id)).toHaveLength(1)
+    expect(durable(lead).pendingMessages).toEqual([])
+    expect(durable(otherLead).pendingMessages).toEqual([])
+  })
+
+  it('retries a contained shared failure for a later caller whose signal remains live', async () => {
+    const { ctx, lead } = await setup([])
+    const message: TeamMessageSnapshot = {
+      id: TeamMessageId('shared-failure-retry'),
+      senderId: lead.id,
+      senderName: 'lead',
+      targetId: SessionId('missing-target'),
+      delivery: 'wakeup',
+      content: content('retry after the first caller stops'),
+    }
+    const inspect = vi.spyOn(ctx.sessionPersistence, 'inspect')
+    const stopped = new AbortController()
+    stopped.abort({ kind: 'test' })
+
+    const first = teamInternals(ctx).mailbox.tryDispatch(lead, message, stopped.signal)
+    const second = teamInternals(ctx).mailbox.tryDispatch(lead, message, SIGNAL)
+    await expect(Promise.all([first, second])).resolves.toEqual([false, false])
+    expect(inspect).toHaveBeenCalledTimes(2)
+  })
+
   it('injects a quiet message addressed to the Lead and checkpoints its receipt', async () => {
     const { ctx, lead } = await setup([])
     const message: TeamMessageSnapshot = {
